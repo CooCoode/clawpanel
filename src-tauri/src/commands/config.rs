@@ -1323,6 +1323,29 @@ pub async fn check_panel_update() -> Result<Value, String> {
     Ok(Value::Object(result))
 }
 
+// === 面板配置 (clawpanel.json) ===
+
+#[tauri::command]
+pub fn read_panel_config() -> Result<Value, String> {
+    let path = super::openclaw_dir().join("clawpanel.json");
+    if !path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+    let content = fs::read_to_string(&path).map_err(|e| format!("读取失败: {e}"))?;
+    serde_json::from_str(&content).map_err(|e| format!("解析失败: {e}"))
+}
+
+#[tauri::command]
+pub fn write_panel_config(config: Value) -> Result<(), String> {
+    let dir = super::openclaw_dir();
+    if !dir.exists() {
+        fs::create_dir_all(&dir).map_err(|e| format!("创建目录失败: {e}"))?;
+    }
+    let path = dir.join("clawpanel.json");
+    let json = serde_json::to_string_pretty(&config).map_err(|e| format!("序列化失败: {e}"))?;
+    fs::write(&path, json).map_err(|e| format!("写入失败: {e}"))
+}
+
 #[tauri::command]
 pub fn get_npm_registry() -> Result<String, String> {
     Ok(get_configured_registry())

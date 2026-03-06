@@ -39,6 +39,8 @@ pub fn run() {
             config::uninstall_gateway,
             config::patch_model_vision,
             config::check_panel_update,
+            config::read_panel_config,
+            config::write_panel_config,
             config::get_npm_registry,
             config::set_npm_registry,
             // 设备密钥 + Gateway 握手

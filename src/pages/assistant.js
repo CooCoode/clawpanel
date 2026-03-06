@@ -42,6 +42,13 @@ const MODES = {
 }
 const DEFAULT_MODE = 'execute'
 
+// ── API 类型 ──
+const API_TYPES = [
+  { value: 'openai', label: 'OpenAI 兼容 (最常用)' },
+  { value: 'anthropic', label: 'Anthropic 原生' },
+  { value: 'google-gemini', label: 'Google Gemini' },
+]
+
 // ── 系统提示词 ──
 const DEFAULT_NAME = '晴辰助手'
 const DEFAULT_PERSONALITY = '专业、友善、简洁。善于分析问题，给出可操作的解决方案。'
@@ -935,6 +942,7 @@ function loadConfig() {
   if (!_config.assistantPersonality) _config.assistantPersonality = DEFAULT_PERSONALITY
   if (!_config.tools) _config.tools = { terminal: false, fileOps: false }
   if (!_config.mode) _config.mode = DEFAULT_MODE
+  if (!_config.apiType) _config.apiType = 'openai'
   return _config
 }
 
@@ -1013,19 +1021,39 @@ function autoTitle(session) {
 
 // ── AI API 调用（自动兼容 Chat Completions + Responses API）──
 
-function cleanBaseUrl(raw) {
+function cleanBaseUrl(raw, apiType) {
   let base = raw.replace(/\/+$/, '')
   base = base.replace(/\/chat\/completions\/?$/, '')
   base = base.replace(/\/completions\/?$/, '')
   base = base.replace(/\/responses\/?$/, '')
+  base = base.replace(/\/messages\/?$/, '')
+  const type = apiType || _config.apiType || 'openai'
+  if (type === 'anthropic') {
+    // Anthropic: https://api.anthropic.com/v1
+    if (!base.endsWith('/v1')) base += '/v1'
+    return base
+  }
+  if (type === 'google-gemini') {
+    // Gemini: https://generativelanguage.googleapis.com/v1beta
+    return base
+  }
   if (!base.endsWith('/v1')) base = base.replace(/\/v1\/.*$/, '/v1')
   return base
 }
 
-function authHeaders() {
+function authHeaders(apiType, apiKey) {
+  const type = apiType || _config.apiType || 'openai'
+  const key = apiKey || _config.apiKey || ''
+  if (type === 'anthropic') {
+    return {
+      'Content-Type': 'application/json',
+      'x-api-key': key,
+      'anthropic-version': '2023-06-01',
+    }
+  }
   return {
     'Content-Type': 'application/json',
-    'Authorization': `Bearer ${_config.apiKey}`,
+    'Authorization': `Bearer ${key}`,
   }
 }
 
@@ -1051,7 +1079,19 @@ async function callAI(messages, onChunk) {
   }, TIMEOUT_TOTAL)
 
   try {
-    // 先尝试 Chat Completions API
+    const apiType = _config.apiType || 'openai'
+
+    if (apiType === 'anthropic') {
+      await callAnthropicMessages(base, allMessages, onChunk)
+      return
+    }
+
+    if (apiType === 'google-gemini') {
+      await callGeminiGenerate(base, allMessages, onChunk)
+      return
+    }
+
+    // OpenAI: 先尝试 Chat Completions API
     try {
       await callChatCompletions(base, allMessages, onChunk)
       return
@@ -1064,7 +1104,6 @@ async function callAI(messages, onChunk) {
       const msg = err.message || ''
       if (msg.includes('legacy protocol') || msg.includes('/v1/responses') || msg.includes('not supported')) {
         console.log('[assistant] Chat Completions 不支持此模型，自动切换到 Responses API')
-        // 重新创建 abort controller（上一个可能已被消费）
         _abortController = new AbortController()
         await callResponsesAPI(base, allMessages, onChunk)
         return
@@ -1209,6 +1248,133 @@ async function callResponsesAPI(base, messages, onChunk) {
       onChunk(json.choices[0].delta.content)
     }
   })
+}
+
+// ── Anthropic Messages API（/v1/messages）──
+async function callAnthropicMessages(base, messages, onChunk) {
+  const url = base + '/messages'
+  const systemMsg = messages.find(m => m.role === 'system')?.content || ''
+  const chatMessages = messages.filter(m => m.role !== 'system')
+
+  const body = {
+    model: _config.model,
+    max_tokens: 8192,
+    stream: true,
+    temperature: _config.temperature || 0.7,
+  }
+  if (systemMsg) body.system = systemMsg
+  body.messages = chatMessages
+
+  const reqTime = Date.now()
+  _lastDebugInfo = {
+    url, method: 'POST',
+    requestBody: { ...body, messages: body.messages.map(m => ({ role: m.role, content: typeof m.content === 'string' ? m.content.slice(0, 200) + (m.content.length > 200 ? '...' : '') : '[multimodal]' })) },
+    requestTime: new Date(reqTime).toLocaleString('zh-CN'),
+  }
+
+  const resp = await fetchWithRetry(url, {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify(body),
+    signal: _abortController.signal,
+  })
+
+  _lastDebugInfo.status = resp.status
+  _lastDebugInfo.contentType = resp.headers.get('content-type') || ''
+  _lastDebugInfo.responseTime = new Date().toLocaleString('zh-CN')
+  _lastDebugInfo.latency = Date.now() - reqTime + 'ms'
+
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => '')
+    _lastDebugInfo.errorBody = errText.slice(0, 500)
+    let errMsg = `API 错误 ${resp.status}`
+    try {
+      const errJson = JSON.parse(errText)
+      errMsg = errJson.error?.message || errJson.message || errMsg
+    } catch {
+      if (errText) errMsg += `: ${errText.slice(0, 200)}`
+    }
+    throw new Error(errMsg)
+  }
+
+  _lastDebugInfo.streaming = true
+  let chunkCount = 0, contentChunks = 0, thinkingChunks = 0
+  let thinkingBuf = ''
+
+  await readSSEStream(resp, (json) => {
+    chunkCount++
+    if (json.type === 'content_block_delta') {
+      const delta = json.delta
+      if (delta?.type === 'text_delta' && delta.text) {
+        contentChunks++
+        onChunk(delta.text)
+      } else if (delta?.type === 'thinking_delta' && delta.thinking) {
+        thinkingChunks++
+        thinkingBuf += delta.thinking
+      }
+    }
+  })
+
+  _lastDebugInfo.chunks = { total: chunkCount, content: contentChunks, thinking: thinkingChunks }
+
+  if (contentChunks === 0 && thinkingBuf) {
+    console.warn('[assistant] Anthropic: 无 text 块，使用 thinking 作为回复')
+    onChunk(thinkingBuf)
+    _lastDebugInfo.fallbackToThinking = true
+  }
+}
+
+// ── Google Gemini API ──
+async function callGeminiGenerate(base, messages, onChunk) {
+  const systemMsg = messages.find(m => m.role === 'system')?.content || ''
+  const chatMessages = messages.filter(m => m.role !== 'system')
+
+  // Gemini 格式转换
+  const contents = chatMessages.map(m => ({
+    role: m.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) }],
+  }))
+
+  const body = {
+    contents,
+    generationConfig: { temperature: _config.temperature || 0.7 },
+  }
+  if (systemMsg) {
+    body.systemInstruction = { parts: [{ text: systemMsg }] }
+  }
+
+  const url = `${base}/models/${_config.model}:streamGenerateContent?alt=sse&key=${_config.apiKey}`
+
+  const reqTime = Date.now()
+  _lastDebugInfo = { url: url.replace(_config.apiKey, '***'), method: 'POST', requestTime: new Date(reqTime).toLocaleString('zh-CN') }
+
+  const resp = await fetchWithRetry(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: _abortController.signal,
+  })
+
+  _lastDebugInfo.status = resp.status
+  _lastDebugInfo.latency = Date.now() - reqTime + 'ms'
+
+  if (!resp.ok) {
+    const errText = await resp.text().catch(() => '')
+    let errMsg = `API 错误 ${resp.status}`
+    try { errMsg = JSON.parse(errText).error?.message || errMsg } catch {}
+    throw new Error(errMsg)
+  }
+
+  _lastDebugInfo.streaming = true
+  let chunkCount = 0
+
+  await readSSEStream(resp, (json) => {
+    chunkCount++
+    const text = json.candidates?.[0]?.content?.parts?.[0]?.text
+    if (text) onChunk(text)
+  })
+
+  _lastDebugInfo.chunks = { total: chunkCount }
 }
 
 // ── 通用 SSE 流读取 ──
@@ -1380,21 +1546,57 @@ async function confirmToolCall(tc, critical = false) {
   return result
 }
 
+// 将 OpenAI 格式工具定义转为 Anthropic 格式
+function convertToolsForAnthropic(tools) {
+  return tools.map(t => ({
+    name: t.function.name,
+    description: t.function.description || '',
+    input_schema: t.function.parameters || { type: 'object', properties: {} },
+  }))
+}
+
+// 将 OpenAI 格式工具定义转为 Gemini 格式
+function convertToolsForGemini(tools) {
+  return [{ functionDeclarations: tools.map(t => ({
+    name: t.function.name,
+    description: t.function.description || '',
+    parameters: t.function.parameters || { type: 'object', properties: {} },
+  }))}]
+}
+
+// 工具调用执行（共用逻辑）
+async function executeToolWithSafety(toolName, args, tcForConfirm) {
+  let result = '', approved = true
+  const mode = MODES[currentMode()]
+  const isCritical = toolName === 'run_command' && isCriticalCommand(args.command)
+  if (isCritical) {
+    approved = await confirmToolCall(tcForConfirm || { function: { name: toolName, arguments: JSON.stringify(args) } }, true)
+    if (!approved) result = '用户拒绝了此危险操作'
+  } else if (mode.confirmDanger && DANGEROUS_TOOLS.has(toolName)) {
+    approved = await confirmToolCall(tcForConfirm || { function: { name: toolName, arguments: JSON.stringify(args) } })
+    if (!approved) result = '用户拒绝了此操作'
+  }
+  if (approved) {
+    try { result = await executeTool(toolName, args) }
+    catch (err) { result = `执行失败: ${typeof err === 'string' ? err : err.message || JSON.stringify(err)}` }
+  }
+  return { result, approved }
+}
+
 // 带工具调用的 AI 请求（非流式，用于 tool_calls 检测循环）
 async function callAIWithTools(messages, onStatus, onToolProgress) {
   if (!_config.baseUrl || !_config.apiKey || !_config.model) {
     throw new Error('请先配置 AI 模型（点击右上角设置按钮）')
   }
 
+  const apiType = _config.apiType || 'openai'
   const base = cleanBaseUrl(_config.baseUrl)
   const tools = getEnabledTools()
   let currentMessages = [{ role: 'system', content: buildSystemPrompt() }, ...messages]
-  const toolHistory = [] // 记录工具调用历史
+  const toolHistory = []
 
   const MAX_AUTO_ROUNDS = 8
-  // 工具调用循环（无硬性上限，超过阈值后询问用户）
   for (let round = 0; ; round++) {
-    // 超过自动轮次后，询问用户是否继续
     if (round >= MAX_AUTO_ROUNDS) {
       const answer = await showAskUserCard({
         question: `AI 已连续调用工具 ${round} 轮，可能陷入循环。你希望怎么做？`,
@@ -1411,6 +1613,120 @@ async function callAIWithTools(messages, onStatus, onToolProgress) {
     _abortController = new AbortController()
     onStatus(round === 0 ? 'AI 思考中...' : `AI 处理工具结果 (第${round + 1}轮)...`)
 
+    // ── Anthropic 工具调用 ──
+    if (apiType === 'anthropic') {
+      const systemMsg = currentMessages.find(m => m.role === 'system')?.content || ''
+      const chatMsgs = currentMessages.filter(m => m.role !== 'system')
+      const body = {
+        model: _config.model,
+        max_tokens: 8192,
+        temperature: _config.temperature || 0.7,
+        messages: chatMsgs,
+      }
+      if (systemMsg) body.system = systemMsg
+      if (tools.length > 0) body.tools = convertToolsForAnthropic(tools)
+
+      const resp = await fetchWithRetry(base + '/messages', {
+        method: 'POST', headers: authHeaders(), body: JSON.stringify(body),
+        signal: _abortController.signal,
+      })
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => '')
+        let errMsg = `API 错误 ${resp.status}`
+        try { errMsg = JSON.parse(errText).error?.message || errMsg } catch {}
+        throw new Error(errMsg)
+      }
+
+      const data = await resp.json()
+      const contentBlocks = data.content || []
+      const toolUses = contentBlocks.filter(b => b.type === 'tool_use')
+      const textContent = contentBlocks.filter(b => b.type === 'text').map(b => b.text).join('')
+
+      if (toolUses.length > 0) {
+        // 将 assistant 消息加入上下文
+        currentMessages.push({ role: 'assistant', content: contentBlocks })
+
+        const toolResults = []
+        for (const tu of toolUses) {
+          const args = tu.input || {}
+          toolHistory.push({ name: tu.name, args, result: null, approved: true, pending: true })
+          onToolProgress(toolHistory)
+
+          const { result, approved } = await executeToolWithSafety(tu.name, args)
+          const last = toolHistory[toolHistory.length - 1]
+          last.result = result; last.approved = approved; last.pending = false
+          onToolProgress(toolHistory)
+
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: tu.id,
+            content: typeof result === 'string' ? result : JSON.stringify(result),
+          })
+        }
+        currentMessages.push({ role: 'user', content: toolResults })
+        continue
+      }
+
+      return { content: textContent, toolHistory }
+    }
+
+    // ── Gemini 工具调用 ──
+    if (apiType === 'google-gemini') {
+      const systemMsg = currentMessages.find(m => m.role === 'system')?.content || ''
+      const chatMsgs = currentMessages.filter(m => m.role !== 'system')
+      const contents = chatMsgs.map(m => ({
+        role: m.role === 'assistant' ? 'model' : m.role === 'tool' ? 'function' : 'user',
+        parts: m.functionResponse
+          ? [{ functionResponse: m.functionResponse }]
+          : [{ text: typeof m.content === 'string' ? m.content : JSON.stringify(m.content) }],
+      }))
+      const body = { contents, generationConfig: { temperature: _config.temperature || 0.7 } }
+      if (systemMsg) body.systemInstruction = { parts: [{ text: systemMsg }] }
+      if (tools.length > 0) body.tools = convertToolsForGemini(tools)
+
+      const url = `${base}/models/${_config.model}:generateContent?key=${_config.apiKey}`
+      const resp = await fetchWithRetry(url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body), signal: _abortController.signal,
+      })
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => '')
+        let errMsg = `API 错误 ${resp.status}`
+        try { errMsg = JSON.parse(errText).error?.message || errMsg } catch {}
+        throw new Error(errMsg)
+      }
+
+      const data = await resp.json()
+      const parts = data.candidates?.[0]?.content?.parts || []
+      const funcCalls = parts.filter(p => p.functionCall)
+      const textParts = parts.filter(p => p.text).map(p => p.text).join('')
+
+      if (funcCalls.length > 0) {
+        currentMessages.push({ role: 'assistant', content: textParts, _geminiParts: parts })
+
+        for (const fc of funcCalls) {
+          const args = fc.functionCall.args || {}
+          toolHistory.push({ name: fc.functionCall.name, args, result: null, approved: true, pending: true })
+          onToolProgress(toolHistory)
+
+          const { result, approved } = await executeToolWithSafety(fc.functionCall.name, args)
+          const last = toolHistory[toolHistory.length - 1]
+          last.result = result; last.approved = approved; last.pending = false
+          onToolProgress(toolHistory)
+
+          currentMessages.push({
+            role: 'tool',
+            content: typeof result === 'string' ? result : JSON.stringify(result),
+            functionResponse: { name: fc.functionCall.name, response: { result: typeof result === 'string' ? result : JSON.stringify(result) } },
+          })
+        }
+        continue
+      }
+
+      return { content: textParts, toolHistory }
+    }
+
+    // ── OpenAI 工具调用 ──
     const body = {
       model: _config.model,
       messages: currentMessages,
@@ -1438,9 +1754,7 @@ async function callAIWithTools(messages, onStatus, onToolProgress) {
 
     if (!assistantMsg) throw new Error('AI 未返回有效响应')
 
-    // 检查是否有 tool_calls
     if (assistantMsg.tool_calls && assistantMsg.tool_calls.length > 0) {
-      // 将 assistant 消息（含 tool_calls）加入上下文
       currentMessages.push(assistantMsg)
 
       for (const tc of assistantMsg.tool_calls) {
@@ -1448,40 +1762,14 @@ async function callAIWithTools(messages, onStatus, onToolProgress) {
         try { args = JSON.parse(tc.function.arguments) } catch { args = {} }
         const toolName = tc.function.name
 
-        // 先显示"执行中"状态的工具块
         toolHistory.push({ name: toolName, args, result: null, approved: true, pending: true })
         onToolProgress(toolHistory)
 
-        let result = ''
-        let approved = true
-
-        // 安全围栏：极端危险命令任何模式都必须确认
-        const mode = MODES[currentMode()]
-        const isCritical = toolName === 'run_command' && isCriticalCommand(args.command)
-        if (isCritical) {
-          approved = await confirmToolCall(tc, true)
-          if (!approved) result = '用户拒绝了此危险操作'
-        } else if (mode.confirmDanger && DANGEROUS_TOOLS.has(toolName)) {
-          approved = await confirmToolCall(tc)
-          if (!approved) result = '用户拒绝了此操作'
-        }
-
-        if (approved) {
-          try {
-            result = await executeTool(toolName, args)
-          } catch (err) {
-            result = `执行失败: ${typeof err === 'string' ? err : err.message || JSON.stringify(err)}`
-          }
-        }
-
-        // 更新工具调用历史（完成状态）
+        const { result, approved } = await executeToolWithSafety(toolName, args, tc)
         const last = toolHistory[toolHistory.length - 1]
-        last.result = result
-        last.approved = approved
-        last.pending = false
+        last.result = result; last.approved = approved; last.pending = false
         onToolProgress(toolHistory)
 
-        // 添加 tool 结果消息
         currentMessages.push({
           role: 'tool',
           tool_call_id: tc.id,
@@ -1489,10 +1777,9 @@ async function callAIWithTools(messages, onStatus, onToolProgress) {
         })
       }
 
-      continue // 继续循环，让 AI 处理工具结果
+      continue
     }
 
-    // 没有 tool_calls，返回最终文本
     const content = assistantMsg.content || assistantMsg.reasoning_content || ''
     return { content, toolHistory }
   }
@@ -1681,6 +1968,12 @@ function showSettings() {
               <label class="form-label">API Base URL</label>
               <input class="form-input" id="ast-baseurl" value="${escHtml(c.baseUrl)}" placeholder="https://api.openai.com/v1">
             </div>
+            <div class="form-group" style="width:170px">
+              <label class="form-label">API 类型</label>
+              <select class="form-input" id="ast-apitype">
+                ${API_TYPES.map(t => `<option value="${t.value}" ${c.apiType === t.value ? 'selected' : ''}>${t.label}</option>`).join('')}
+              </select>
+            </div>
           </div>
           <div style="display:flex;gap:10px;align-items:flex-end">
             <div class="form-group" style="flex:1;margin-bottom:0">
@@ -1706,7 +1999,11 @@ function showSettings() {
               <input class="form-input" id="ast-temp" type="number" value="${c.temperature || 0.7}" min="0" max="2" step="0.1">
             </div>
           </div>
-          <div class="form-hint" style="margin-top:-4px">自动兼容 Chat Completions 和 Responses API</div>
+          <div class="form-hint" id="ast-api-hint" style="margin-top:-4px">${{
+            openai: '自动兼容 Chat Completions 和 Responses API',
+            anthropic: '使用 Anthropic Messages API（/v1/messages）',
+            'google-gemini': '使用 Gemini generateContent API',
+          }[c.apiType || 'openai']}</div>
         </div>
         <div class="ast-tab-panel" data-panel="tools">
           <div class="form-hint" style="margin-bottom:10px">工具开关优先级高于模式设置。关闭的工具在任何模式下都不可用。</div>
@@ -1752,6 +2049,21 @@ function showSettings() {
     })
   })
 
+  // API 类型切换时更新提示文本和 placeholder
+  const apiTypeSelect = overlay.querySelector('#ast-apitype')
+  const apiHintEl = overlay.querySelector('#ast-api-hint')
+  const baseUrlInput = overlay.querySelector('#ast-baseurl')
+  const apiKeyInput = overlay.querySelector('#ast-apikey')
+  apiTypeSelect.addEventListener('change', () => {
+    const v = apiTypeSelect.value
+    const hints = { openai: '自动兼容 Chat Completions 和 Responses API', anthropic: '使用 Anthropic Messages API（/v1/messages）', 'google-gemini': '使用 Gemini generateContent API' }
+    const placeholders = { openai: 'https://api.openai.com/v1', anthropic: 'https://api.anthropic.com', 'google-gemini': 'https://generativelanguage.googleapis.com/v1beta' }
+    const keyPlaceholders = { openai: 'sk-...', anthropic: 'sk-ant-...', 'google-gemini': 'AIza...' }
+    apiHintEl.textContent = hints[v] || hints.openai
+    baseUrlInput.placeholder = placeholders[v] || placeholders.openai
+    apiKeyInput.placeholder = keyPlaceholders[v] || keyPlaceholders.openai
+  })
+
   const resultEl = overlay.querySelector('#ast-test-result')
   const modelInput = overlay.querySelector('#ast-model')
   const dropdown = overlay.querySelector('#ast-model-dropdown')
@@ -1762,6 +2074,7 @@ function showSettings() {
     const baseUrl = overlay.querySelector('#ast-baseurl').value.trim()
     const apiKey = overlay.querySelector('#ast-apikey').value.trim()
     const model = overlay.querySelector('#ast-model').value.trim()
+    const selApiType = overlay.querySelector('#ast-apitype').value || 'openai'
     if (!baseUrl || !apiKey) {
       resultEl.innerHTML = '<span style="color:var(--warning)">请先填写 Base URL 和 API Key</span>'
       return
@@ -1773,93 +2086,78 @@ function showSettings() {
     btn.disabled = true
     btn.textContent = '测试中...'
     resultEl.innerHTML = '<span style="color:var(--text-tertiary)">正在发送测试消息...</span>'
-    const base = cleanBaseUrl(baseUrl)
-    const hdrs = { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + apiKey }
+    const base = cleanBaseUrl(baseUrl, selApiType)
+    const hdrs = authHeaders(selApiType, apiKey)
     const t0 = Date.now()
-    const reqBody = { model, messages: [{ role: 'user', content: '你好，请用一句话回复' }], max_tokens: 200 }
-    const reqUrl = base + '/chat/completions'
 
-    let respStatus = 0, respBody = '', reply = '', usedApi = 'Chat Completions', fallback = false
+    let respStatus = 0, respBody = '', reply = '', usedApi = '', reqUrl = '', reqBody = {}
 
     try {
-      const resp = await fetch(reqUrl, {
-        method: 'POST', headers: hdrs,
-        body: JSON.stringify(reqBody),
-        signal: AbortSignal.timeout(30000),
-      })
-      respStatus = resp.status
-      respBody = await resp.text()
-
-      if (!resp.ok) {
-        // 检查是否需要切到 Responses API
-        if (respBody.includes('legacy protocol') || respBody.includes('/v1/responses') || respBody.includes('not supported')) {
-          fallback = true
-        }
-      }
-
-      if (!fallback) {
-        // 尝试从各种可能的格式中提取回复
+      if (selApiType === 'anthropic') {
+        usedApi = 'Anthropic Messages'
+        reqUrl = base + '/messages'
+        reqBody = { model, messages: [{ role: 'user', content: '你好，请用一句话回复' }], max_tokens: 200 }
+        const resp = await fetch(reqUrl, { method: 'POST', headers: hdrs, body: JSON.stringify(reqBody), signal: AbortSignal.timeout(30000) })
+        respStatus = resp.status; respBody = await resp.text()
         try {
           const data = JSON.parse(respBody)
-          const msg = data.choices?.[0]?.message
-          reply = msg?.content
-            || msg?.reasoning_content
-            || data.choices?.[0]?.text
-            || data.output?.text
-            || data.result?.output?.text
-            || data.data?.choices?.[0]?.message?.content
-            || ''
-          // 如果 content 为空但有 reasoning_content，标记为推理内容
-          if (!msg?.content && msg?.reasoning_content) {
-            reply = '[推理内容] ' + reply
-          }
+          reply = data.content?.filter(b => b.type === 'text').map(b => b.text).join('') || ''
         } catch {}
+      } else if (selApiType === 'google-gemini') {
+        usedApi = 'Gemini'
+        reqUrl = `${base}/models/${model}:generateContent?key=***`
+        reqBody = { contents: [{ role: 'user', parts: [{ text: '你好，请用一句话回复' }] }] }
+        const realUrl = `${base}/models/${model}:generateContent?key=${apiKey}`
+        const resp = await fetch(realUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(reqBody), signal: AbortSignal.timeout(30000) })
+        respStatus = resp.status; respBody = await resp.text()
+        try {
+          const data = JSON.parse(respBody)
+          reply = data.candidates?.[0]?.content?.parts?.[0]?.text || ''
+        } catch {}
+      } else {
+        // OpenAI: Chat Completions + Responses fallback
+        usedApi = 'Chat Completions'
+        reqUrl = base + '/chat/completions'
+        reqBody = { model, messages: [{ role: 'user', content: '你好，请用一句话回复' }], max_tokens: 200 }
+        const resp = await fetch(reqUrl, { method: 'POST', headers: hdrs, body: JSON.stringify(reqBody), signal: AbortSignal.timeout(30000) })
+        respStatus = resp.status; respBody = await resp.text()
+
+        let fallback = false
+        if (!resp.ok && (respBody.includes('legacy protocol') || respBody.includes('/v1/responses') || respBody.includes('not supported'))) {
+          fallback = true
+        }
+
+        if (!fallback) {
+          try {
+            const data = JSON.parse(respBody)
+            const msg = data.choices?.[0]?.message
+            reply = msg?.content || msg?.reasoning_content || data.choices?.[0]?.text || data.output?.text || ''
+            if (!msg?.content && msg?.reasoning_content) reply = '[推理内容] ' + reply
+          } catch {}
+        }
+
+        if (fallback) {
+          usedApi = 'Responses'
+          reqUrl = base + '/responses'
+          reqBody = { model, input: [{ role: 'user', content: '你好，请用一句话回复' }], max_output_tokens: 200 }
+          try {
+            const resp2 = await fetch(reqUrl, { method: 'POST', headers: hdrs, body: JSON.stringify(reqBody), signal: AbortSignal.timeout(30000) })
+            respStatus = resp2.status; respBody = await resp2.text()
+            try { const d = JSON.parse(respBody); reply = d.output_text || d.output?.[0]?.content?.[0]?.text || '' } catch {}
+          } catch (err2) {
+            resultEl.innerHTML = buildTestResult({ success: false, elapsed: Date.now() - t0, usedApi, reqUrl, reqBody, respStatus: 0, respBody: '', error: err2.message })
+            btn.disabled = false; btn.textContent = '测试'; return
+          }
+        }
       }
     } catch (err) {
-      const elapsed = Date.now() - t0
-      resultEl.innerHTML = buildTestResult({
-        success: false, elapsed, usedApi,
-        reqUrl, reqBody, respStatus: 0, respBody: '', error: err.message,
-      })
-      btn.disabled = false; btn.textContent = '测试对话'; return
+      resultEl.innerHTML = buildTestResult({ success: false, elapsed: Date.now() - t0, usedApi, reqUrl, reqBody, respStatus: 0, respBody: '', error: err.message })
+      btn.disabled = false; btn.textContent = '测试'; return
     }
 
-    // Responses API fallback
-    if (fallback) {
-      usedApi = 'Responses'
-      const reqUrl2 = base + '/responses'
-      const reqBody2 = { model, input: [{ role: 'user', content: '你好，请用一句话回复' }], max_output_tokens: 200 }
-      try {
-        const resp2 = await fetch(reqUrl2, {
-          method: 'POST', headers: hdrs,
-          body: JSON.stringify(reqBody2),
-          signal: AbortSignal.timeout(30000),
-        })
-        respStatus = resp2.status
-        respBody = await resp2.text()
-        try {
-          const data2 = JSON.parse(respBody)
-          reply = data2.output_text || data2.output?.[0]?.content?.[0]?.text || ''
-        } catch {}
-      } catch (err) {
-        const elapsed = Date.now() - t0
-        resultEl.innerHTML = buildTestResult({
-          success: false, elapsed, usedApi,
-          reqUrl: reqUrl2, reqBody: reqBody2, respStatus: 0, respBody: '', error: err.message,
-        })
-        btn.disabled = false; btn.textContent = '测试对话'; return
-      }
-    }
-
-    const elapsed = Date.now() - t0
-    resultEl.innerHTML = buildTestResult({
-      success: !!reply, elapsed, usedApi,
-      reqUrl: fallback ? base + '/responses' : reqUrl,
-      reqBody: fallback ? { model, input: [{ role: 'user', content: '你好，请用一句话回复' }], max_output_tokens: 200 } : reqBody,
-      respStatus, respBody, reply,
-    })
+    resultEl.innerHTML = buildTestResult({ success: !!reply, elapsed: Date.now() - t0, usedApi, reqUrl, reqBody, respStatus, respBody, reply })
     btn.disabled = false
-    btn.textContent = '测试对话'
+    btn.textContent = '测试'
   }
 
   // 获取模型列表
@@ -1874,27 +2172,55 @@ function showSettings() {
     btn.disabled = true
     btn.textContent = '获取中...'
     resultEl.innerHTML = '<span style="color:var(--text-tertiary)">正在获取模型列表...</span>'
+    const selApiType = overlay.querySelector('#ast-apitype').value || 'openai'
     try {
-      const base = cleanBaseUrl(baseUrl)
-      const resp = await fetch(base + '/models', {
-        headers: { 'Authorization': 'Bearer ' + apiKey },
-        signal: AbortSignal.timeout(10000),
-      })
-      if (!resp.ok) {
-        const text = await resp.text().catch(() => '')
-        let msg = 'HTTP ' + resp.status
-        try { msg = JSON.parse(text).error?.message || msg } catch {}
-        resultEl.innerHTML = '<span style="color:var(--error)">✗ ' + escHtml(msg) + '</span>'
-        return
+      const base = cleanBaseUrl(baseUrl, selApiType)
+      const hdrs = authHeaders(selApiType, apiKey)
+      let models = []
+
+      if (selApiType === 'anthropic') {
+        // Anthropic: GET /v1/models
+        const resp = await fetch(base + '/models', { headers: hdrs, signal: AbortSignal.timeout(10000) })
+        if (!resp.ok) {
+          const text = await resp.text().catch(() => '')
+          let msg = 'HTTP ' + resp.status
+          try { msg = JSON.parse(text).error?.message || msg } catch {}
+          resultEl.innerHTML = '<span style="color:var(--error)">✗ ' + escHtml(msg) + '</span>'
+          return
+        }
+        const data = await resp.json()
+        models = (data.data || []).map(m => m.id).filter(Boolean).sort()
+      } else if (selApiType === 'google-gemini') {
+        // Gemini: GET /models?key=xxx
+        const resp = await fetch(base + '/models?key=' + apiKey, { signal: AbortSignal.timeout(10000) })
+        if (!resp.ok) {
+          const text = await resp.text().catch(() => '')
+          let msg = 'HTTP ' + resp.status
+          try { msg = JSON.parse(text).error?.message || msg } catch {}
+          resultEl.innerHTML = '<span style="color:var(--error)">✗ ' + escHtml(msg) + '</span>'
+          return
+        }
+        const data = await resp.json()
+        models = (data.models || []).map(m => m.name?.replace('models/', '') || m.name).filter(Boolean).sort()
+      } else {
+        // OpenAI: GET /v1/models
+        const resp = await fetch(base + '/models', { headers: hdrs, signal: AbortSignal.timeout(10000) })
+        if (!resp.ok) {
+          const text = await resp.text().catch(() => '')
+          let msg = 'HTTP ' + resp.status
+          try { msg = JSON.parse(text).error?.message || msg } catch {}
+          resultEl.innerHTML = '<span style="color:var(--error)">✗ ' + escHtml(msg) + '</span>'
+          return
+        }
+        const data = await resp.json()
+        models = (data.data || []).map(m => m.id).filter(Boolean).sort()
       }
-      const data = await resp.json()
-      const models = (data.data || []).map(m => m.id).filter(Boolean).sort()
+
       if (models.length === 0) {
         resultEl.innerHTML = '<span style="color:var(--warning)">未发现可用模型</span>'
         return
       }
       resultEl.innerHTML = '<span style="color:var(--success)">✓ 发现 ' + models.length + ' 个模型，点击下方列表选择</span>'
-      // 显示下拉列表
       dropdown.innerHTML = models.map(m =>
         '<div class="ast-model-option" data-model="' + escHtml(m) + '">' + escHtml(m) + '</div>'
       ).join('')
@@ -1903,7 +2229,7 @@ function showSettings() {
       resultEl.innerHTML = '<span style="color:var(--error)">✗ ' + escHtml(err.message) + '</span>'
     } finally {
       btn.disabled = false
-      btn.textContent = '获取模型列表'
+      btn.textContent = '拉取'
     }
   }
 
@@ -1935,6 +2261,7 @@ function showSettings() {
     _config.apiKey = overlay.querySelector('#ast-apikey').value.trim()
     _config.model = overlay.querySelector('#ast-model').value.trim()
     _config.temperature = parseFloat(overlay.querySelector('#ast-temp').value) || 0.7
+    _config.apiType = overlay.querySelector('#ast-apitype').value || 'openai'
     // 工具开关
     _config.tools.terminal = overlay.querySelector('#ast-tool-terminal').checked
     _config.tools.fileOps = overlay.querySelector('#ast-tool-fileops').checked

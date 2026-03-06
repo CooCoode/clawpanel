@@ -21,15 +21,123 @@ const isWindows = process.platform === 'win32'
 const isMac = process.platform === 'darwin'
 const isLinux = process.platform === 'linux'
 const SCOPES = ['operator.admin', 'operator.approvals', 'operator.pairing', 'operator.read', 'operator.write']
+const PANEL_CONFIG_PATH = path.join(OPENCLAW_DIR, 'clawpanel.json')
+
+// === 访问密码 & Session 管理 ===
+
+const _sessions = new Map() // token → { expires }
+const SESSION_TTL = 24 * 60 * 60 * 1000 // 24h
+const AUTH_EXEMPT = new Set(['auth_check', 'auth_login', 'auth_logout'])
+
+// 登录限速：防暴力破解（IP 级别，5次失败后锁定60秒）
+const _loginAttempts = new Map() // ip → { count, lockedUntil }
+const MAX_LOGIN_ATTEMPTS = 5
+const LOCKOUT_DURATION = 60 * 1000 // 60s
+
+function checkLoginRateLimit(ip) {
+  const now = Date.now()
+  const record = _loginAttempts.get(ip)
+  if (!record) return null
+  if (record.lockedUntil && now < record.lockedUntil) {
+    const remaining = Math.ceil((record.lockedUntil - now) / 1000)
+    return `登录失败次数过多，请 ${remaining} 秒后再试`
+  }
+  if (record.lockedUntil && now >= record.lockedUntil) {
+    _loginAttempts.delete(ip)
+  }
+  return null
+}
+
+function recordLoginFailure(ip) {
+  const record = _loginAttempts.get(ip) || { count: 0, lockedUntil: null }
+  record.count++
+  if (record.count >= MAX_LOGIN_ATTEMPTS) {
+    record.lockedUntil = Date.now() + LOCKOUT_DURATION
+    record.count = 0
+  }
+  _loginAttempts.set(ip, record)
+}
+
+function clearLoginAttempts(ip) {
+  _loginAttempts.delete(ip)
+}
+
+// 配置缓存：避免每次请求同步读磁盘（TTL 2秒，写入时立即失效）
+let _panelConfigCache = null
+let _panelConfigCacheTime = 0
+const CONFIG_CACHE_TTL = 2000 // 2s
+
+function readPanelConfig() {
+  const now = Date.now()
+  if (_panelConfigCache && (now - _panelConfigCacheTime) < CONFIG_CACHE_TTL) {
+    return JSON.parse(JSON.stringify(_panelConfigCache))
+  }
+  try {
+    if (fs.existsSync(PANEL_CONFIG_PATH)) {
+      _panelConfigCache = JSON.parse(fs.readFileSync(PANEL_CONFIG_PATH, 'utf8'))
+      _panelConfigCacheTime = now
+      return JSON.parse(JSON.stringify(_panelConfigCache))
+    }
+  } catch {}
+  return {}
+}
+
+function invalidateConfigCache() {
+  _panelConfigCache = null
+  _panelConfigCacheTime = 0
+}
+
+function getAccessPassword() {
+  return readPanelConfig().accessPassword || ''
+}
+
+function parseCookies(req) {
+  const obj = {}
+  ;(req.headers.cookie || '').split(';').forEach(pair => {
+    const [k, ...v] = pair.trim().split('=')
+    if (k) obj[k] = decodeURIComponent(v.join('='))
+  })
+  return obj
+}
+
+function isAuthenticated(req) {
+  const pw = getAccessPassword()
+  if (!pw) return true // 未设密码，放行
+  const cookies = parseCookies(req)
+  const token = cookies.clawpanel_session
+  if (!token) return false
+  const session = _sessions.get(token)
+  if (!session || Date.now() > session.expires) {
+    _sessions.delete(token)
+    return false
+  }
+  return true
+}
+
+function checkPasswordStrength(pw) {
+  if (!pw || pw.length < 6) return '密码至少 6 位'
+  if (pw.length > 64) return '密码不能超过 64 位'
+  if (/^\d+$/.test(pw)) return '密码不能是纯数字'
+  const weak = ['123456', '654321', 'password', 'admin', 'qwerty', 'abc123', '111111', '000000', 'letmein', 'welcome', 'clawpanel', 'openclaw']
+  if (weak.includes(pw.toLowerCase())) return '密码太常见，请换一个更安全的密码'
+  return null // 通过
+}
 
 function isUnsafePath(p) {
   return !p || p.includes('..') || p.includes('\0') || path.isAbsolute(p)
 }
 
+const MAX_BODY_SIZE = 1024 * 1024 // 1MB
+
 function readBody(req) {
   return new Promise((resolve) => {
     let body = ''
-    req.on('data', chunk => body += chunk)
+    let size = 0
+    req.on('data', chunk => {
+      size += chunk.length
+      if (size > MAX_BODY_SIZE) { req.destroy(); resolve({}); return }
+      body += chunk
+    })
     req.on('end', () => {
       try { resolve(JSON.parse(body || '{}')) }
       catch { resolve({}) }
@@ -201,6 +309,7 @@ function winStartGateway() {
     detached: true,
     stdio: ['ignore', out, err],
     shell: true,
+    windowsHide: true,
     cwd: homedir(),
   })
   child.unref()
@@ -210,7 +319,7 @@ function winStopGateway() {
   const { running, pid } = winCheckGateway()
   if (!running || !pid) throw new Error('Gateway 未运行')
   try {
-    execSync(`taskkill /F /PID ${pid} /T`, { timeout: 5000 })
+    execSync(`taskkill /F /PID ${pid} /T`, { timeout: 5000, windowsHide: true })
   } catch (e) {
     throw new Error('停止失败: ' + (e.message || e))
   }
@@ -220,7 +329,7 @@ function winCheckGateway() {
   const port = readGatewayPort()
   try {
     // 用 netstat 精确查找监听指定端口的进程 PID
-    const out = execSync(`netstat -ano | findstr ":${port}" | findstr "LISTENING"`, { timeout: 3000 }).toString().trim()
+    const out = execSync(`netstat -ano | findstr ":${port}" | findstr "LISTENING"`, { timeout: 3000, windowsHide: true }).toString().trim()
     if (!out) return { running: false, pid: null }
     // 提取 PID（最后一列）
     const parts = out.split('\n')[0].trim().split(/\s+/)
@@ -228,7 +337,7 @@ function winCheckGateway() {
     if (!pid) return { running: false, pid: null }
     // 验证进程是否为 node/openclaw（排除其他程序碰巧占用同端口）
     try {
-      const taskOut = execSync(`tasklist /FI "PID eq ${pid}" /FO CSV /NH`, { timeout: 3000 }).toString().trim()
+      const taskOut = execSync(`tasklist /FI "PID eq ${pid}" /FO CSV /NH`, { timeout: 3000, windowsHide: true }).toString().trim()
       const isGateway = /node|openclaw/i.test(taskOut)
       return { running: isGateway, pid: isGateway ? pid : null }
     } catch {
@@ -483,7 +592,7 @@ const handlers = {
 
   check_node() {
     try {
-      const ver = execSync('node --version 2>&1').toString().trim()
+      const ver = execSync('node --version 2>&1', { windowsHide: true }).toString().trim()
       return { installed: true, version: ver }
     } catch {
       return { installed: false, version: null }
@@ -501,7 +610,7 @@ const handlers = {
       } catch {}
     }
     if (!current) {
-      try { current = execSync('openclaw --version 2>&1').toString().trim().split(/\s+/).pop() } catch {}
+      try { current = execSync('openclaw --version 2>&1', { windowsHide: true }).toString().trim().split(/\s+/).pop() } catch {}
     }
     return { current, latest: null, update_available: false, source: 'chinese' }
   },
@@ -573,7 +682,7 @@ const handlers = {
     const logPath = path.join(LOGS_DIR, file)
     if (!fs.existsSync(logPath)) return ''
     try {
-      return execSync(`tail -${lines} "${logPath}" 2>&1`).toString()
+      return execSync(`tail -${lines} "${logPath}" 2>&1`, { windowsHide: true }).toString()
     } catch {
       const content = fs.readFileSync(logPath, 'utf8')
       return content.split('\n').slice(-lines).join('\n')
@@ -714,8 +823,8 @@ const handlers = {
 
   // Gateway 安装/卸载
   install_gateway() {
-    try { execSync('openclaw --version 2>&1') } catch { throw new Error('openclaw CLI 未安装') }
-    return execSync('openclaw gateway install 2>&1').toString() || 'Gateway 服务已安装'
+    try { execSync('openclaw --version 2>&1', { windowsHide: true }) } catch { throw new Error('openclaw CLI 未安装') }
+    return execSync('openclaw gateway install 2>&1', { windowsHide: true }).toString() || 'Gateway 服务已安装'
   },
 
   upgrade_openclaw({ source = 'chinese' } = {}) {
@@ -723,7 +832,7 @@ const handlers = {
     const pkg = source === 'official' ? '@anthropic-ai/claw' : '@qingchencloud/openclaw-zh'
     const npmBin = isWindows ? 'npm.cmd' : 'npm'
     try {
-      const out = execSync(`${npmBin} install ${pkg}@latest --prefix "${OPENCLAW_DIR}" 2>&1`, { timeout: 120000 }).toString()
+      const out = execSync(`${npmBin} install ${pkg}@latest --prefix "${OPENCLAW_DIR}" 2>&1`, { timeout: 120000, windowsHide: true }).toString()
       return `升级完成 (${source})\n${out.slice(-200)}`
     } catch (e) {
       throw new Error('升级失败: ' + (e.stderr?.toString() || e.message).slice(-300))
@@ -931,6 +1040,22 @@ const handlers = {
     return null
   },
 
+  // === 访问密码认证 ===
+  auth_check() {
+    const pw = getAccessPassword()
+    return { required: !!pw, authenticated: false /* 由中间件覆写 */ }
+  },
+  auth_login() { throw new Error('由中间件处理') },
+  auth_logout() { throw new Error('由中间件处理') },
+  auth_set_password({ password }) {
+    const cfg = readPanelConfig()
+    cfg.accessPassword = password || ''
+    fs.writeFileSync(PANEL_CONFIG_PATH, JSON.stringify(cfg, null, 2))
+    // 清除所有 session（密码变更后强制重新登录）
+    _sessions.clear()
+    return true
+  },
+
   check_panel_update() { return { latest: null, url: 'https://github.com/qingchencloud/clawpanel/releases' } },
   write_env_file({ path: p, config }) {
     const expanded = p.startsWith('~/') ? path.join(homedir(), p.slice(2)) : p
@@ -944,37 +1069,233 @@ const handlers = {
 
 // === Vite 插件 ===
 
+// 初始化：密码检测 + 启动日志 + 定时清理
+function _initApi() {
+  const cfg = readPanelConfig()
+  if (!cfg.accessPassword && !cfg.ignoreRisk) {
+    cfg.accessPassword = '123456'
+    cfg.mustChangePassword = true
+    if (!fs.existsSync(OPENCLAW_DIR)) fs.mkdirSync(OPENCLAW_DIR, { recursive: true })
+    fs.writeFileSync(PANEL_CONFIG_PATH, JSON.stringify(cfg, null, 2))
+    invalidateConfigCache()
+    console.log('[api] ⚠️  首次启动，默认访问密码: 123456')
+    console.log('[api] ⚠️  首次登录后将强制要求修改密码')
+  }
+  const pw = getAccessPassword()
+  console.log('[api] API 已启动，配置目录:', OPENCLAW_DIR)
+  console.log('[api] 平台:', isMac ? 'macOS' : process.platform)
+  console.log('[api] 访问密码:', pw ? '已设置' : (cfg.ignoreRisk ? '无视风险模式（无密码）' : '未设置'))
+
+  // 定时清理过期 session 和登录限速记录（每 10 分钟）
+  setInterval(() => {
+    const now = Date.now()
+    for (const [token, session] of _sessions) {
+      if (now > session.expires) _sessions.delete(token)
+    }
+    for (const [ip, record] of _loginAttempts) {
+      if (record.lockedUntil && now >= record.lockedUntil) _loginAttempts.delete(ip)
+    }
+  }, 10 * 60 * 1000)
+}
+
+// API 中间件（dev server 和 preview server 共用）
+async function _apiMiddleware(req, res, next) {
+  if (!req.url?.startsWith('/__api/')) return next()
+
+  const cmd = req.url.slice(7).split('?')[0]
+
+  // --- 认证特殊处理 ---
+  if (cmd === 'auth_check') {
+    const cfg = readPanelConfig()
+    const pw = cfg.accessPassword || ''
+    const isDefault = pw === '123456'
+    const resp = {
+      required: !!pw,
+      authenticated: !pw || isAuthenticated(req),
+      mustChangePassword: isDefault,
+    }
+    if (isDefault) resp.defaultPassword = '123456'
+    res.setHeader('Content-Type', 'application/json')
+    res.end(JSON.stringify(resp))
+    return
+  }
+
+  if (cmd === 'auth_login') {
+    const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || ''
+    const rateLimitErr = checkLoginRateLimit(clientIp)
+    if (rateLimitErr) {
+      res.statusCode = 429
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: rateLimitErr }))
+      return
+    }
+    const args = await readBody(req)
+    const cfg = readPanelConfig()
+    const pw = cfg.accessPassword || ''
+    if (!pw) {
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ success: true }))
+      return
+    }
+    if (args.password !== pw) {
+      recordLoginFailure(clientIp)
+      res.statusCode = 401
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: '密码错误' }))
+      return
+    }
+    clearLoginAttempts(clientIp)
+    const token = crypto.randomUUID()
+    _sessions.set(token, { expires: Date.now() + SESSION_TTL })
+    res.setHeader('Set-Cookie', `clawpanel_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL / 1000}`)
+    res.setHeader('Content-Type', 'application/json')
+    res.end(JSON.stringify({ success: true, mustChangePassword: !!cfg.mustChangePassword }))
+    return
+  }
+
+  if (cmd === 'auth_change_password') {
+    const args = await readBody(req)
+    const cfg = readPanelConfig()
+    const pw = cfg.accessPassword || ''
+    if (pw && !isAuthenticated(req)) {
+      res.statusCode = 401
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: '未登录' }))
+      return
+    }
+    if (pw && args.oldPassword !== pw) {
+      res.statusCode = 400
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: '当前密码错误' }))
+      return
+    }
+    const weakErr = checkPasswordStrength(args.newPassword)
+    if (weakErr) {
+      res.statusCode = 400
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: weakErr }))
+      return
+    }
+    if (args.newPassword === pw) {
+      res.statusCode = 400
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: '新密码不能与旧密码相同' }))
+      return
+    }
+    cfg.accessPassword = args.newPassword
+    delete cfg.mustChangePassword
+    delete cfg.ignoreRisk
+    fs.writeFileSync(PANEL_CONFIG_PATH, JSON.stringify(cfg, null, 2))
+    invalidateConfigCache()
+    _sessions.clear()
+    const token = crypto.randomUUID()
+    _sessions.set(token, { expires: Date.now() + SESSION_TTL })
+    res.setHeader('Set-Cookie', `clawpanel_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_TTL / 1000}`)
+    res.setHeader('Content-Type', 'application/json')
+    res.end(JSON.stringify({ success: true }))
+    return
+  }
+
+  if (cmd === 'auth_status') {
+    const cfg = readPanelConfig()
+    if (cfg.accessPassword && !isAuthenticated(req)) {
+      res.statusCode = 401
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: '未登录' }))
+      return
+    }
+    const isDefault = cfg.accessPassword === '123456'
+    const result = {
+      hasPassword: !!cfg.accessPassword,
+      mustChangePassword: isDefault,
+      ignoreRisk: !!cfg.ignoreRisk,
+    }
+    if (isDefault) {
+      result.defaultPassword = '123456'
+    }
+    res.setHeader('Content-Type', 'application/json')
+    res.end(JSON.stringify(result))
+    return
+  }
+
+  if (cmd === 'auth_ignore_risk') {
+    if (!isAuthenticated(req)) {
+      res.statusCode = 401
+      res.setHeader('Content-Type', 'application/json')
+      res.end(JSON.stringify({ error: '未登录' }))
+      return
+    }
+    const args = await readBody(req)
+    const cfg = readPanelConfig()
+    if (args.enable) {
+      delete cfg.accessPassword
+      delete cfg.mustChangePassword
+      cfg.ignoreRisk = true
+      _sessions.clear()
+    } else {
+      delete cfg.ignoreRisk
+    }
+    fs.writeFileSync(PANEL_CONFIG_PATH, JSON.stringify(cfg, null, 2))
+    invalidateConfigCache()
+    res.setHeader('Content-Type', 'application/json')
+    res.end(JSON.stringify({ success: true }))
+    return
+  }
+
+  if (cmd === 'auth_logout') {
+    const cookies = parseCookies(req)
+    if (cookies.clawpanel_session) _sessions.delete(cookies.clawpanel_session)
+    res.setHeader('Set-Cookie', 'clawpanel_session=; Path=/; HttpOnly; Max-Age=0')
+    res.setHeader('Content-Type', 'application/json')
+    res.end(JSON.stringify({ success: true }))
+    return
+  }
+
+  // --- 认证中间件：非豁免接口必须校验 ---
+  if (!isAuthenticated(req)) {
+    res.statusCode = 401
+    res.setHeader('Content-Type', 'application/json')
+    res.end(JSON.stringify({ error: '未登录', code: 'AUTH_REQUIRED' }))
+    return
+  }
+
+  const handler = handlers[cmd]
+
+  if (!handler) {
+    res.statusCode = 404
+    res.setHeader('Content-Type', 'application/json')
+    res.end(JSON.stringify({ error: `未实现的命令: ${cmd}` }))
+    return
+  }
+
+  try {
+    const args = await readBody(req)
+    const result = await handler(args)
+    res.setHeader('Content-Type', 'application/json')
+    res.end(JSON.stringify(result))
+  } catch (e) {
+    res.statusCode = 500
+    res.setHeader('Content-Type', 'application/json')
+    res.end(JSON.stringify({ error: e.message || String(e) }))
+  }
+}
+
 export function devApiPlugin() {
+  let _inited = false
+  function ensureInit() {
+    if (_inited) return
+    _inited = true
+    _initApi()
+  }
   return {
     name: 'clawpanel-dev-api',
     configureServer(server) {
-      console.log('[dev-api] 开发 API 已启动，配置目录:', OPENCLAW_DIR)
-      console.log('[dev-api] 平台:', isMac ? 'macOS' : process.platform)
-
-      server.middlewares.use(async (req, res, next) => {
-        if (!req.url?.startsWith('/__api/')) return next()
-
-        const cmd = req.url.slice(7).split('?')[0]
-        const handler = handlers[cmd]
-
-        if (!handler) {
-          res.statusCode = 404
-          res.setHeader('Content-Type', 'application/json')
-          res.end(JSON.stringify({ error: `未实现的命令: ${cmd}` }))
-          return
-        }
-
-        try {
-          const args = await readBody(req)
-          const result = await handler(args)
-          res.setHeader('Content-Type', 'application/json')
-          res.end(JSON.stringify(result))
-        } catch (e) {
-          res.statusCode = 500
-          res.setHeader('Content-Type', 'application/json')
-          res.end(JSON.stringify({ error: e.message || String(e) }))
-        }
-      })
-    }
+      ensureInit()
+      server.middlewares.use(_apiMiddleware)
+    },
+    configurePreviewServer(server) {
+      ensureInit()
+      server.middlewares.use(_apiMiddleware)
+    },
   }
 }

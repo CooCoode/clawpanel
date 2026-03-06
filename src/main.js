@@ -7,6 +7,7 @@ import { initTheme } from './lib/theme.js'
 import { detectOpenclawStatus, isOpenclawReady, isGatewayRunning, onGatewayChange, startGatewayPoll, onGuardianGiveUp, resetAutoRestart } from './lib/app-state.js'
 import { wsClient } from './lib/ws-client.js'
 import { api } from './lib/tauri-api.js'
+import { version as APP_VERSION } from '../package.json'
 
 // 样式
 import './style/variables.css'
@@ -21,6 +22,130 @@ import './style/assistant.css'
 
 // 初始化主题
 initTheme()
+
+// === 访问密码保护（Web + 桌面端通用） ===
+const isTauri = !!window.__TAURI_INTERNALS__
+
+async function checkAuth() {
+  if (isTauri) {
+    // 桌面端：读 clawpanel.json，检查密码配置
+    try {
+      const { api } = await import('./lib/tauri-api.js')
+      const cfg = await api.readPanelConfig()
+      if (!cfg.accessPassword) return { ok: true }
+      if (sessionStorage.getItem('clawpanel_authed') === '1') return { ok: true }
+      // 默认密码：直接传给登录页，避免二次读取
+      const defaultPw = (cfg.mustChangePassword && cfg.accessPassword) ? cfg.accessPassword : null
+      return { ok: false, defaultPw }
+    } catch { return { ok: true } }
+  }
+  // Web 模式
+  try {
+    const resp = await fetch('/__api/auth_check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    const data = await resp.json()
+    if (!data.required || data.authenticated) return { ok: true }
+    return { ok: false, defaultPw: data.defaultPassword || null }
+  } catch { return { ok: true } }
+}
+
+const _logoSvg = `<svg class="login-logo" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+  <path d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z"/>
+  <path d="M18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.456 2.456L21.75 6l-1.035.259a3.375 3.375 0 00-2.456 2.456z"/>
+</svg>`
+
+function _hideSplash() {
+  const splash = document.getElementById('splash')
+  if (splash) { splash.classList.add('hide'); setTimeout(() => splash.remove(), 500) }
+}
+
+function showLoginOverlay(defaultPw) {
+  const hasDefault = !!defaultPw
+  const overlay = document.createElement('div')
+  overlay.id = 'login-overlay'
+  overlay.innerHTML = `
+    <div class="login-card">
+      ${_logoSvg}
+      <div class="login-title">ClawPanel</div>
+      <div class="login-desc">${hasDefault
+        ? '首次使用，默认密码已自动填充<br><span style="font-size:12px;color:#6366f1;font-weight:600">登录后请前往「安全设置」修改密码</span>'
+        : (isTauri ? '应用已锁定，请输入密码' : '请输入访问密码')}</div>
+      <form id="login-form">
+        <input class="login-input" type="${hasDefault ? 'text' : 'password'}" id="login-pw" placeholder="访问密码" autocomplete="current-password" autofocus value="${hasDefault ? defaultPw : ''}" />
+        <button class="login-btn" type="submit">登 录</button>
+        <div class="login-error" id="login-error"></div>
+      </form>
+      <div style="margin-top:20px;font-size:11px;color:#aaa;text-align:center">
+        <a href="https://claw.qt.cool" target="_blank" rel="noopener" style="color:#aaa;text-decoration:none">claw.qt.cool</a>
+        <span style="margin:0 6px">·</span>v${APP_VERSION}
+      </div>
+    </div>
+  `
+  document.body.appendChild(overlay)
+  _hideSplash()
+
+  return new Promise((resolve) => {
+    overlay.querySelector('#login-form').addEventListener('submit', async (e) => {
+      e.preventDefault()
+      const pw = overlay.querySelector('#login-pw').value
+      const btn = overlay.querySelector('.login-btn')
+      const errEl = overlay.querySelector('#login-error')
+      btn.disabled = true
+      btn.textContent = '登录中...'
+      errEl.textContent = ''
+      try {
+        if (isTauri) {
+          // 桌面端：本地比对密码
+          const { api } = await import('./lib/tauri-api.js')
+          const cfg = await api.readPanelConfig()
+          if (pw !== cfg.accessPassword) {
+            errEl.textContent = '密码错误'
+            btn.disabled = false
+            btn.textContent = '登 录'
+            return
+          }
+          sessionStorage.setItem('clawpanel_authed', '1')
+          overlay.classList.add('hide')
+          setTimeout(() => overlay.remove(), 400)
+          if (cfg.accessPassword === '123456') {
+            sessionStorage.setItem('clawpanel_must_change_pw', '1')
+          }
+          resolve()
+        } else {
+          // Web 模式：调后端
+          const resp = await fetch('/__api/auth_login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ password: pw }),
+          })
+          const data = await resp.json()
+          if (!resp.ok) {
+            errEl.textContent = data.error || '登录失败'
+            btn.disabled = false
+            btn.textContent = '登 录'
+            return
+          }
+          overlay.classList.add('hide')
+          setTimeout(() => overlay.remove(), 400)
+          if (data.mustChangePassword || data.defaultPassword === '123456') {
+            sessionStorage.setItem('clawpanel_must_change_pw', '1')
+          }
+          resolve()
+        }
+      } catch (err) {
+        errEl.textContent = '网络错误: ' + (err.message || err)
+        btn.disabled = false
+        btn.textContent = '登 录'
+      }
+    })
+  })
+}
+
+// 全局 401 拦截：API 返回 401 时弹出登录
+window.__clawpanel_show_login = async function() {
+  if (document.getElementById('login-overlay')) return
+  await showLoginOverlay()
+  location.reload()
+}
 
 const sidebar = document.getElementById('sidebar')
 const content = document.getElementById('content')
@@ -37,6 +162,7 @@ async function boot() {
   registerRoute('/gateway', () => import('./pages/gateway.js'))
   registerRoute('/memory', () => import('./pages/memory.js'))
   registerRoute('/extensions', () => import('./pages/extensions.js'))
+  registerRoute('/security', () => import('./pages/security.js'))
   registerRoute('/about', () => import('./pages/about.js'))
   registerRoute('/assistant', () => import('./pages/assistant.js'))
   registerRoute('/setup', () => import('./pages/setup.js'))
@@ -49,6 +175,19 @@ async function boot() {
   if (splash) {
     splash.classList.add('hide')
     setTimeout(() => splash.remove(), 500)
+  }
+
+  // 默认密码提醒横幅
+  if (sessionStorage.getItem('clawpanel_must_change_pw') === '1') {
+    const banner = document.createElement('div')
+    banner.id = 'pw-change-banner'
+    banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;padding:10px 20px;display:flex;align-items:center;justify-content:center;gap:12px;font-size:13px;font-weight:500;box-shadow:0 2px 8px rgba(0,0,0,0.15)'
+    banner.innerHTML = `
+      <span>⚠️ 当前使用的是系统生成的默认密码，为了安全请尽快修改</span>
+      <a href="#/security" style="color:#fff;background:rgba(255,255,255,0.2);padding:4px 14px;border-radius:6px;text-decoration:none;font-size:12px;font-weight:600" onclick="document.getElementById('pw-change-banner').remove();sessionStorage.removeItem('clawpanel_must_change_pw')">前往安全设置</a>
+      <button onclick="this.parentElement.remove()" style="background:none;border:none;color:rgba(255,255,255,0.7);cursor:pointer;font-size:16px;padding:0 4px;margin-left:4px">✕</button>
+    `
+    document.body.prepend(banner)
   }
 
   // 后台检测状态，检测完再决定是否跳转 setup
@@ -240,4 +379,9 @@ function showGuardianRecovery() {
   })
 }
 
-boot()
+// 启动：先检查认证，再加载应用
+;(async () => {
+  const auth = await checkAuth()
+  if (!auth.ok) await showLoginOverlay(auth.defaultPw)
+  boot()
+})()

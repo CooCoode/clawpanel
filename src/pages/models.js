@@ -9,7 +9,7 @@ import { showModal, showConfirm } from '../components/modal.js'
 // API 接口类型选项
 const API_TYPES = [
   { value: 'openai-completions', label: 'OpenAI 兼容 (最常用)' },
-  { value: 'anthropic', label: 'Anthropic 原生' },
+  { value: 'anthropic-messages', label: 'Anthropic 原生' },
   { value: 'openai-responses', label: 'OpenAI Responses' },
   { value: 'google-gemini', label: 'Google Gemini' },
 ]
@@ -17,7 +17,7 @@ const API_TYPES = [
 // 服务商快捷预设
 const PROVIDER_PRESETS = [
   { key: 'openai', label: 'OpenAI 官方', baseUrl: 'https://api.openai.com/v1', api: 'openai-completions' },
-  { key: 'anthropic', label: 'Anthropic 官方', baseUrl: 'https://api.anthropic.com', api: 'anthropic' },
+  { key: 'anthropic', label: 'Anthropic 官方', baseUrl: 'https://api.anthropic.com', api: 'anthropic-messages' },
   { key: 'deepseek', label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', api: 'openai-completions' },
   { key: 'google', label: 'Google Gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', api: 'google-gemini' },
 ]

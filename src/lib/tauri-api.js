@@ -113,6 +113,10 @@ async function webInvoke(cmd, args) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(args),
   })
+  if (resp.status === 401 && window.__clawpanel_show_login) {
+    window.__clawpanel_show_login()
+    throw new Error('需要登录')
+  }
   if (!resp.ok) {
     const data = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }))
     throw new Error(data.error || `HTTP ${resp.status}`)
@@ -297,6 +301,10 @@ export const api = {
   writeMemoryFile: (path, content, category, agentId) => { invalidate('list_memory_files', 'read_memory_file'); return invoke('write_memory_file', { path, content, category: category || 'memory', agentId: agentId || null }) },
   deleteMemoryFile: (path, agentId) => { invalidate('list_memory_files'); return invoke('delete_memory_file', { path, agentId: agentId || null }) },
   exportMemoryZip: (category, agentId) => invoke('export_memory_zip', { category, agentId: agentId || null }),
+
+  // 面板配置 (clawpanel.json)
+  readPanelConfig: () => invoke('read_panel_config'),
+  writePanelConfig: (config) => invoke('write_panel_config', { config }),
 
   // 安装/部署
   checkInstallation: () => cachedInvoke('check_installation', {}, 60000),

@@ -186,6 +186,61 @@ function renderSteps(page, { node, cliOk, config }) {
 }
 
 function renderInstallSection() {
+  const isWin = navigator.platform?.startsWith('Win') || navigator.userAgent?.includes('Windows')
+  const isMac = navigator.platform?.startsWith('Mac') || navigator.userAgent?.includes('Macintosh')
+  const isDesktop = !!window.__TAURI_INTERNALS__
+
+  let envHint = ''
+  if (isDesktop) {
+    envHint = `
+      <div style="margin-top:var(--space-sm);padding:10px 12px;background:var(--bg-tertiary);border-radius:var(--radius-sm);border-left:3px solid var(--warning);font-size:var(--font-size-xs);color:var(--text-secondary);line-height:1.7">
+        <strong style="color:var(--text-primary)">找不到已安装的 OpenClaw？</strong>
+        <p style="margin:6px 0 2px">ClawPanel 桌面版只能管理<strong>本机</strong>安装的 OpenClaw。以下环境中的安装无法被检测到：</p>
+        <ul style="margin:4px 0 8px 16px;padding:0">
+          ${isWin ? `
+            <li><strong>WSL (Windows 子系统)</strong> — OpenClaw 装在 WSL 里，Windows 侧无法访问</li>
+            <li><strong>Docker 容器</strong> — 容器内的安装与宿主机隔离</li>
+          ` : ''}
+          ${isMac ? `
+            <li><strong>Docker 容器</strong> — 容器内的安装与宿主机隔离</li>
+            <li><strong>远程服务器</strong> — 安装在其他机器上</li>
+          ` : ''}
+          ${!isWin && !isMac ? `
+            <li><strong>Docker 容器</strong> — 容器内的安装与宿主机隔离</li>
+          ` : ''}
+        </ul>
+        <details style="cursor:pointer">
+          <summary style="font-weight:600;color:var(--primary);margin-bottom:6px">
+            在对应环境中安装管理面板
+          </summary>
+          <div style="margin-top:8px">
+            ${isWin ? `
+              <div style="margin-bottom:10px">
+                <div style="font-weight:600;margin-bottom:4px">WSL 中使用 Web 版：</div>
+                <div style="margin-bottom:2px;opacity:0.8">打开 WSL 终端，一键部署 ClawPanel Web 版：</div>
+                <code style="display:block;background:var(--bg-secondary);padding:6px 10px;border-radius:4px;user-select:all;word-break:break-all">curl -fsSL https://claw.qt.cool/deploy.sh | bash</code>
+                <div style="margin-top:4px;opacity:0.7">部署后在浏览器访问 WSL 的 IP 即可管理。</div>
+              </div>
+            ` : ''}
+            <div style="margin-bottom:10px">
+              <div style="font-weight:600;margin-bottom:4px">Docker 容器中使用：</div>
+              <div style="margin-bottom:2px;opacity:0.8">在容器内安装 OpenClaw + ClawPanel Web 版：</div>
+              <code style="display:block;background:var(--bg-secondary);padding:6px 10px;border-radius:4px;user-select:all;word-break:break-all;margin-bottom:4px">npm i -g @qingchencloud/openclaw-zh</code>
+              <code style="display:block;background:var(--bg-secondary);padding:6px 10px;border-radius:4px;user-select:all;word-break:break-all">curl -fsSL https://claw.qt.cool/deploy.sh | bash</code>
+            </div>
+            <div>
+              <div style="font-weight:600;margin-bottom:4px">远程服务器：</div>
+              <div style="margin-bottom:2px;opacity:0.8">SSH 登录服务器后执行：</div>
+              <code style="display:block;background:var(--bg-secondary);padding:6px 10px;border-radius:4px;user-select:all;word-break:break-all">curl -fsSL https://claw.qt.cool/deploy.sh | bash</code>
+            </div>
+          </div>
+        </details>
+        <div style="margin-top:6px;opacity:0.7">
+          或者，你也可以在本机重新安装 OpenClaw（使用下方的「一键安装」）。
+        </div>
+      </div>`
+  }
+
   return `
     <p style="color:var(--text-secondary);font-size:var(--font-size-sm);margin-bottom:var(--space-sm)">
       选择版本后点击安装，将自动执行 npm 全局安装。
@@ -215,6 +270,7 @@ function renderInstallSection() {
       </select>
     </div>
     <button class="btn btn-primary btn-sm" id="btn-install">一键安装</button>
+    ${envHint}
   `
 }
 

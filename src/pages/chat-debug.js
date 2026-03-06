@@ -292,7 +292,8 @@ function testWebSocket(page) {
   api.readOpenclawConfig().then(config => {
     const port = config?.gateway?.port || 18789
     const token = config?.gateway?.auth?.token || ''
-    const url = `ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`
+    const wsHost = window.__TAURI_INTERNALS__ ? `127.0.0.1:${port}` : location.host
+    const url = `ws://${wsHost}/ws?token=${encodeURIComponent(token)}`
 
     addLog(`📡 连接地址: ${url}`)
     addLog(`🔑 Token: ${token ? token.substring(0, 20) + '...' : '(空)'}`)
@@ -512,7 +513,8 @@ async function fixPairing(page) {
     const config = await api.readOpenclawConfig()
     const port = config?.gateway?.port || 18789
     const token = config?.gateway?.auth?.token || ''
-    const url = `ws://127.0.0.1:${port}/ws?token=${encodeURIComponent(token)}`
+    const wsHost = window.__TAURI_INTERNALS__ ? `127.0.0.1:${port}` : location.host
+    const url = `ws://${wsHost}/ws?token=${encodeURIComponent(token)}`
 
     const ws = new WebSocket(url)
 
