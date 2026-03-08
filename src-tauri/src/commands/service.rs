@@ -397,7 +397,7 @@ mod platform {
         Err("Gateway 启动超时，请检查终端窗口中的错误信息".into())
     }
 
-    /// 关闭 Gateway 终端窗口
+    /// 关闭 Gateway（兼容旧版隐藏进程和新版可见终端）
     pub async fn stop_service_impl(_label: &str) -> Result<(), String> {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         // 先尝试优雅停止
@@ -420,13 +420,33 @@ mod platform {
             }
         }
 
-        // 强制关闭终端窗口（会同时杀掉其中的 node 进程）
+        // 按窗口标题强杀（新版可见终端）
         let _ = TokioCommand::new("cmd")
             .args(["/c", "taskkill", "/f", "/fi", &format!("WINDOWTITLE eq {}", GATEWAY_WINDOW_TITLE)])
             .creation_flags(CREATE_NO_WINDOW)
             .output()
             .await;
 
+        // 兜底：按端口查杀（兼容旧版隐藏进程）
+        if check_service_status(0, "").0 {
+            let port = read_gateway_port();
+            let _ = kill_by_port(port).await;
+        }
+
+        Ok(())
+    }
+
+    /// 通过 netstat 查找占用端口的 PID 并强制杀掉
+    async fn kill_by_port(port: u16) -> Result<(), String> {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let netstat_cmd = format!(
+            "for /f \"tokens=5\" %a in ('netstat -ano ^| findstr LISTENING ^| findstr :{port}') do taskkill /f /pid %a"
+        );
+        let _ = TokioCommand::new("cmd")
+            .args(["/c", &netstat_cmd])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .await;
         Ok(())
     }
 
