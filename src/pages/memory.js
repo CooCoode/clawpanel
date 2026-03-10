@@ -73,6 +73,9 @@ export async function render() {
     state.agentId = e.target.value
     state.currentPath = null
     resetEditor(page)
+    // 显示加载动画
+    const tree = page.querySelector('#file-tree')
+    tree.innerHTML = '<div class="stat-card loading-placeholder" style="height:32px;margin:8px"></div><div class="stat-card loading-placeholder" style="height:32px;margin:8px"></div><div class="stat-card loading-placeholder" style="height:32px;margin:8px"></div>'
     loadFiles(page, state)
   }
 
@@ -86,6 +89,9 @@ export async function render() {
       const cat = CATEGORIES.find(c => c.key === state.category)
       page.querySelector('#category-desc').textContent = cat?.desc || ''
       resetEditor(page)
+      // 显示加载动画
+      const tree = page.querySelector('#file-tree')
+      tree.innerHTML = '<div class="stat-card loading-placeholder" style="height:32px;margin:8px"></div><div class="stat-card loading-placeholder" style="height:32px;margin:8px"></div><div class="stat-card loading-placeholder" style="height:32px;margin:8px"></div>'
       loadFiles(page, state)
     }
   })
