@@ -5,6 +5,39 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.2] - 2026-03-12
+
+### 修复 (Fixes)
+
+- **接口地址不再强制拼接 /v1** — 火山引擎（/v3）等第三方 API 不再被错误追加 /v1，仅 Ollama（端口 11434）自动补全
+- **OpenClaw 升级 SSH 失败** — 增加 `git://` 和 `git+ssh://` 协议重定向到 HTTPS，`--unset-all` + `--add` 确保 4 条规则全部生效
+- **飞书插件安装失败** — 新增内置插件检测（`is_plugin_builtin`），已内置时自动跳过 npm install
+- **飞书保存 ReferenceError** — 修复 `overlay is not defined`（应为 `modal`），修复表单收集不支持 `<select>` 字段
+- **飞书插件版本持久化** — 切换官方/内置插件后重新打开弹窗不再丢失选择，自动检测已安装的插件版本
+- **龙虾军团 Docker 检测报错** — 修复桌面版 Tauri 模式下返回 HTML 导致 JSON 解析失败，新增「需要 Web 部署模式」专属指引
+- **聊天重复消息** — 新增 runId 去重机制，防止 Gateway 多次触发同一消息产生重复气泡
+- **定时任务 RPC 参数** — `cron.remove` / `cron.run` / `cron.update` 参数从 `name` 修正为 `id`
+- **消息渠道操作响应慢** — `save` / `toggle` / `remove` 的 Gateway 重载改为后台异步执行，API 立即返回
+- **消息渠道 toggle 不刷新** — 扩展缓存失效范围至 `read_openclaw_config` + `read_platform_config`
+- **Linux 非 root 用户 sudo** — `npm_command()` 自动检测 `euid != 0` 并加 `sudo`
+- **Control UI 远程访问** — 动态使用浏览器域名/IP 替代硬编码 `127.0.0.1`，自动附带 Gateway auth token
+- **npm 镜像源降级重试** — 淘宝源安装失败时自动切换到官方源重试
+- **QQ 插件 native binding** — 检测到 OpenClaw CLI 原生依赖缺失时给出友好提示和修复命令
+- **错误诊断增强** — exit 128 区分 SSH/Git 未安装；新增 native binding 检测
+
+### 新功能 (Features)
+
+- **关于页面公司信息** — 新增「关于我们」板块：武汉晴辰天下网络科技有限公司
+- **模型预设共享模块** — 提取 `src/lib/model-presets.js`，消除 models.js 和 assistant.js 重复维护
+- **飞书双插件支持** — 内置插件（聊天入口）或飞书官方插件（操作文档/日历/任务）可选
+- **晴辰助手快捷选择** — 设置弹窗新增 OpenAI / DeepSeek / Ollama 等服务商一键填充按钮
+
+### 改进 (Improvements)
+
+- **官网下载链接动态化** — 从 `latest.json` 自动获取最新版本号，走 `claw.qt.cool/proxy/dl/` 国内代理
+- **Linux 部署文档完善** — 升级指南增加 Gitee 镜像、sudo 权限说明、淘宝源降级说明
+- **linux-deploy.sh** — Gitee clone fallback + sudo npm + 淘宝源 registry + 官方源降级
+
 ## [0.8.0] - 2026-03-12
 
 ### 新功能 (Features)

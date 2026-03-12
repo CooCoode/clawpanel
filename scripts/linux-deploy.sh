@@ -9,6 +9,7 @@ echo ""
 
 PANEL_PORT=1420
 REPO_URL="https://github.com/qingchencloud/clawpanel.git"
+REPO_URL_GITEE="https://gitee.com/QtCodeCreators/clawpanel.git"
 NPM_REGISTRY="https://registry.npmmirror.com"
 
 # 检测权限模式
@@ -115,7 +116,13 @@ install_openclaw() {
         echo "✅ OpenClaw 已安装: $(openclaw --version 2>/dev/null || echo '未知版本')"
     else
         echo "📦 安装 OpenClaw 汉化版..."
-        npm install -g @qingchencloud/openclaw-zh --registry "$NPM_REGISTRY"
+        if [ "$IS_ROOT" = true ]; then
+            npm install -g @qingchencloud/openclaw-zh --registry "$NPM_REGISTRY" || \
+            npm install -g @qingchencloud/openclaw-zh --registry https://registry.npmjs.org
+        else
+            sudo npm install -g @qingchencloud/openclaw-zh --registry "$NPM_REGISTRY" || \
+            sudo npm install -g @qingchencloud/openclaw-zh --registry https://registry.npmjs.org
+        fi
         echo "✅ OpenClaw 安装完成"
     fi
 
@@ -132,13 +139,16 @@ install_clawpanel() {
         echo "📦 ClawPanel 已存在，更新中..."
         cd "$INSTALL_DIR"
         git pull origin main 2>/dev/null || true
-        npm install
+        npm install --registry "$NPM_REGISTRY"
     else
         echo "📦 克隆 ClawPanel..."
         mkdir -p "$INSTALL_DIR"
-        git clone "$REPO_URL" "$INSTALL_DIR"
+        if ! git clone "$REPO_URL" "$INSTALL_DIR" 2>/dev/null; then
+            echo "⚠️  GitHub 克隆失败，切换到 Gitee 国内镜像..."
+            git clone "$REPO_URL_GITEE" "$INSTALL_DIR"
+        fi
         cd "$INSTALL_DIR"
-        npm install
+        npm install --registry "$NPM_REGISTRY"
     fi
     # 生产构建（生成优化后的静态文件）
     echo "📦 构建生产版本..."

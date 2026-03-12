@@ -107,6 +107,11 @@ async function webInvoke(cmd, args) {
     if (!isTauri && window.__clawpanel_show_login) window.__clawpanel_show_login()
     throw new Error('需要登录')
   }
+  // 检测后端是否可用：如果返回的是 HTML（非 JSON），说明后端未运行
+  const ct = (resp.headers.get('content-type') || '').toLowerCase()
+  if (ct.includes('text/html') || ct.includes('text/plain')) {
+    throw new Error('后端服务未运行，该功能需要 Web 部署模式')
+  }
   if (!resp.ok) {
     const data = await resp.json().catch(() => ({ error: `HTTP ${resp.status}` }))
     throw new Error(data.error || `HTTP ${resp.status}`)
@@ -196,7 +201,7 @@ export const api = {
   readPlatformConfig: (platform) => invoke('read_platform_config', { platform }),
   saveMessagingPlatform: (platform, form) => { invalidate('list_configured_platforms', 'read_platform_config'); return invoke('save_messaging_platform', { platform, form }) },
   removeMessagingPlatform: (platform) => { invalidate('list_configured_platforms', 'read_platform_config'); return invoke('remove_messaging_platform', { platform }) },
-  toggleMessagingPlatform: (platform, enabled) => { invalidate('list_configured_platforms'); return invoke('toggle_messaging_platform', { platform, enabled }) },
+  toggleMessagingPlatform: (platform, enabled) => { invalidate('list_configured_platforms', 'read_openclaw_config', 'read_platform_config'); return invoke('toggle_messaging_platform', { platform, enabled }) },
   verifyBotToken: (platform, form) => invoke('verify_bot_token', { platform, form }),
   listConfiguredPlatforms: () => cachedInvoke('list_configured_platforms', {}, 5000),
   getChannelPluginStatus: (pluginId) => invoke('get_channel_plugin_status', { pluginId }),

@@ -6,60 +6,7 @@ import { api } from '../lib/tauri-api.js'
 import { toast } from '../components/toast.js'
 import { showModal, showConfirm } from '../components/modal.js'
 import { icon, statusIcon } from '../lib/icons.js'
-
-// API 接口类型选项
-const API_TYPES = [
-  { value: 'openai-completions', label: 'OpenAI 兼容 (最常用)' },
-  { value: 'anthropic-messages', label: 'Anthropic 原生' },
-  { value: 'openai-responses', label: 'OpenAI Responses' },
-  { value: 'google-gemini', label: 'Google Gemini' },
-]
-
-// 服务商快捷预设
-const PROVIDER_PRESETS = [
-  { key: 'openai', label: 'OpenAI 官方', baseUrl: 'https://api.openai.com/v1', api: 'openai-completions' },
-  { key: 'anthropic', label: 'Anthropic 官方', baseUrl: 'https://api.anthropic.com', api: 'anthropic-messages' },
-  { key: 'deepseek', label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', api: 'openai-completions' },
-  { key: 'google', label: 'Google Gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', api: 'google-gemini' },
-  { key: 'ollama', label: 'Ollama (本地)', baseUrl: 'http://127.0.0.1:11434/v1', api: 'openai-completions' },
-]
-
-// gpt.qt.cool 推广配置
-const QTCOOL = {
-  baseUrl: 'https://gpt.qt.cool/v1',
-  defaultKey: 'sk-0JDu7hyc51ZKD4iNebpFu07EUEhXmVVc',
-  site: 'https://gpt.qt.cool/',
-  usageUrl: 'https://gpt.qt.cool/user?key=',
-  providerKey: 'qtcool',
-  api: 'openai-completions',
-  models: []  // 不使用硬编码模型列表，始终从 API 动态获取最新列表
-}
-
-// 常用模型预设（按服务商分组）
-const MODEL_PRESETS = {
-  openai: [
-    { id: 'gpt-4o', name: 'GPT-4o', contextWindow: 128000 },
-    { id: 'gpt-4o-mini', name: 'GPT-4o Mini', contextWindow: 128000 },
-    { id: 'o3-mini', name: 'o3 Mini', contextWindow: 200000, reasoning: true },
-  ],
-  anthropic: [
-    { id: 'claude-sonnet-4-5-20250514', name: 'Claude Sonnet 4.5', contextWindow: 200000 },
-    { id: 'claude-haiku-3-5-20241022', name: 'Claude Haiku 3.5', contextWindow: 200000 },
-  ],
-  deepseek: [
-    { id: 'deepseek-chat', name: 'DeepSeek V3', contextWindow: 64000 },
-    { id: 'deepseek-reasoner', name: 'DeepSeek R1', contextWindow: 64000, reasoning: true },
-  ],
-  google: [
-    { id: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro', contextWindow: 1000000, reasoning: true },
-    { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', contextWindow: 1000000 },
-  ],
-  ollama: [
-    { id: 'qwen2.5:7b', name: 'Qwen 2.5 7B', contextWindow: 32768 },
-    { id: 'llama3.2', name: 'Llama 3.2', contextWindow: 8192 },
-    { id: 'gemma3', name: 'Gemma 3', contextWindow: 32768 },
-  ],
-}
+import { API_TYPES, PROVIDER_PRESETS, QTCOOL, MODEL_PRESETS, fetchQtcoolModels } from '../lib/model-presets.js'
 
 export async function render() {
   const page = document.createElement('div')
@@ -431,13 +378,8 @@ function normalizeProviderUrls(config) {
       if (!url.endsWith('/v1')) url += '/v1'
     } else if (apiType !== 'google-gemini') {
       // Ollama 端口检测：11434 默认需要加 /v1
-      if (/:11434$/.test(url)) url += '/v1'
-      // 其他 OpenAI 兼容: 确保有 /v1
-      if (!url.endsWith('/v1')) {
-        const idx = url.indexOf('/v1/')
-        if (idx >= 0) url = url.slice(0, idx + 3)
-        else url += '/v1'
-      }
+      if (/:11434$/.test(url) && !url.endsWith('/v1')) url += '/v1'
+      // 不再强制追加 /v1，尊重用户填写的 URL（火山引擎等第三方用 /v3 等路径）
     }
     p.baseUrl = url
   }
@@ -786,23 +728,8 @@ function bindTopActions(page, state) {
     btn.textContent = '获取模型列表...'
     btn.disabled = true
 
-    // 动态获取模型列表，失败则用静态 fallback
-    let models = QTCOOL.models
-    try {
-      const resp = await fetch(QTCOOL.baseUrl + '/models', {
-        headers: { 'Authorization': 'Bearer ' + QTCOOL.defaultKey },
-        signal: AbortSignal.timeout(8000)
-      })
-      if (resp.ok) {
-        const data = await resp.json()
-        if (data.data && data.data.length) {
-          models = data.data.map(m => ({
-            id: m.id, name: m.id, contextWindow: 128000,
-            reasoning: m.id.includes('codex')
-          })).sort((a, b) => b.id.localeCompare(a.id))
-        }
-      }
-    } catch { /* use fallback */ }
+    // 动态获取模型列表（共享逻辑）
+    const models = await fetchQtcoolModels()
 
     btn.innerHTML = `${icon('zap', 14)} 一键添加全部模型`
     btn.disabled = false

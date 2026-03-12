@@ -49,6 +49,7 @@ let _currentAiBubble = null, _currentAiText = '', _currentAiImages = [], _curren
 let _isStreaming = false, _isSending = false, _messageQueue = [], _streamStartTime = 0
 let _lastRenderTime = 0, _renderPending = false, _lastHistoryHash = ''
 let _streamSafetyTimer = null, _unsubEvent = null, _unsubReady = null, _unsubStatus = null
+let _seenRunIds = new Set()
 let _pageActive = false
 let _errorTimer = null, _lastErrorMsg = null
 let _attachments = []
@@ -886,6 +887,17 @@ function handleChatEvent(payload) {
   if (payload.sessionKey && payload.sessionKey !== _sessionKey && _sessionKey) return
 
   const { state } = payload
+  const runId = payload.runId
+
+  // 重复 run 过滤：跳过已完成的 runId 的后续事件（Gateway 可能对同一消息触发多个 run）
+  if (runId && state === 'final' && _seenRunIds.has(runId)) {
+    console.log('[chat] 跳过重复 final, runId:', runId)
+    return
+  }
+  if (runId && state === 'delta' && _seenRunIds.has(runId) && !_isStreaming) {
+    console.log('[chat] 跳过已完成 run 的 delta, runId:', runId)
+    return
+  }
 
   if (state === 'delta') {
     const c = extractChatContent(payload.message)
@@ -935,6 +947,14 @@ function handleChatEvent(payload) {
     const hasContent = finalText || _currentAiImages.length || _currentAiVideos.length || _currentAiAudios.length || _currentAiFiles.length
     // 忽略空 final（Gateway 会为一条消息触发多个 run，部分是空 final）
     if (!_currentAiBubble && !hasContent) return
+    // 标记 runId 为已处理，防止重复
+    if (runId) {
+      _seenRunIds.add(runId)
+      if (_seenRunIds.size > 200) {
+        const first = _seenRunIds.values().next().value
+        _seenRunIds.delete(first)
+      }
+    }
     showTyping(false)
     // 如果流式阶段没有创建 bubble，从 final message 中提取
     if (!_currentAiBubble && hasContent) {

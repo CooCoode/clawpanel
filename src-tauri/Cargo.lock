@@ -328,12 +328,13 @@ dependencies = [
 
 [[package]]
 name = "clawpanel"
-version = "0.8.0"
+version = "0.8.2"
 dependencies = [
  "base64 0.22.1",
  "chrono",
  "dirs",
  "ed25519-dalek",
+ "libc",
  "rand 0.8.5",
  "regex",
  "reqwest 0.12.28",

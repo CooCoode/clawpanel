@@ -48,18 +48,23 @@ const PLATFORM_REGISTRY = {
     iconName: 'message-square',
     desc: '飞书/Lark 企业消息集成，支持文档、多维表格、日历等飞书生态能力',
     guide: [
+      '<b>选择插件版本</b>：<br>• <b>内置插件</b>（默认）— OpenClaw 自带，主要做聊天入口，安装简单<br>• <b>飞书官方插件</b> — 飞书团队开发，能以你的身份操作飞书（写文档、建表、约日程）<br><span style="color:var(--text-tertiary)">两者互斥，只能启用一个</span>',
       '前往 <a href="https://open.feishu.cn/app" target="_blank" style="color:var(--accent);text-decoration:underline">飞书开放平台</a>，创建企业自建应用，在「应用能力」中添加<b>机器人</b>能力',
       '在<b>凭证与基础信息</b>页面获取 <b>App ID</b> 和 <b>App Secret</b>',
       '进入<b>权限管理</b>，参照 <a href="https://open.larkoffice.com/document/server-docs/application-scope/scope-list" target="_blank" style="color:var(--accent);text-decoration:underline">权限列表</a> 开通所需权限（<code>im:message</code> 等）',
       '进入<b>事件订阅</b>，选择<b>使用长连接（WebSocket）</b>模式，订阅<b>接收消息</b>和<b>卡片回调</b>事件。如有 user access token 开关请打开',
-      '将 App ID 和 App Secret 填入下方表单，校验后保存。ClawPanel 会自动安装飞书插件并写入配置',
-      '保存后在飞书中向机器人发消息，获取配对码；你可以直接在下方“配对审批”区域粘贴配对码完成绑定，也可以在终端执行 <code>openclaw pairing approve feishu &lt;配对码&gt; --notify</code>',
+      '将 App ID 和 App Secret 填入下方表单，校验后保存',
+      '保存后在飞书中向机器人发消息，获取配对码；你可以直接在下方"配对审批"区域粘贴配对码完成绑定，也可以在终端执行 <code>openclaw pairing approve feishu &lt;配对码&gt; --notify</code>',
     ],
-    guideFooter: '<div style="margin-top:8px;font-size:var(--font-size-xs);color:var(--text-tertiary)">国际版 Lark 用户请将域名切换为 <b>lark</b>。详细教程：<a href="https://www.feishu.cn/content/article/7613711414611463386" target="_blank" style="color:var(--accent);text-decoration:underline">OpenClaw 飞书官方插件使用指南</a></div>',
+    guideFooter: '<div style="margin-top:8px;font-size:var(--font-size-xs);color:var(--text-tertiary)">国际版 Lark 用户请将域名切换为 <b>lark</b>。详细教程：<a href="https://www.feishu.cn/content/article/7613711414611463386" target="_blank" style="color:var(--accent);text-decoration:underline">OpenClaw 飞书官方插件使用指南</a> · <a href="https://github.com/AlexAnys/openclaw-feishu" target="_blank" style="color:var(--accent);text-decoration:underline">两个插件怎么选</a></div>',
     fields: [
       { key: 'appId', label: 'App ID', placeholder: 'cli_xxxxxxxxxx', required: true },
       { key: 'appSecret', label: 'App Secret', placeholder: '应用密钥', secret: true, required: true },
       { key: 'domain', label: '域名', placeholder: 'feishu（国际版选 lark）', required: false },
+      { key: 'pluginVersion', label: '插件版本', type: 'select', required: false, options: [
+        { value: 'builtin', label: '内置插件（默认，聊天入口）' },
+        { value: 'official', label: '飞书官方插件（操作文档/日历/任务）' },
+      ]},
     ],
     pluginRequired: '@openclaw/feishu@latest',
     pluginId: 'feishu',
@@ -293,8 +298,27 @@ async function openConfigDialog(pid, page, state) {
     </div>
   `
 
+  // 飞书插件版本检测：根据已安装的插件自动选择
+  if (pid === 'feishu' && !existing.pluginVersion) {
+    try {
+      const officialStatus = await api.getChannelPluginStatus('feishu-openclaw-plugin')
+      if (officialStatus?.installed) existing.pluginVersion = 'official'
+      else existing.pluginVersion = localStorage.getItem('clawpanel-feishu-plugin-version') || 'builtin'
+    } catch { existing.pluginVersion = 'builtin' }
+  }
+
   const fieldsHtml = reg.fields.map((f, i) => {
     const val = existing[f.key] || ''
+    if (f.type === 'select' && f.options) {
+      return `
+        <div class="form-group">
+          <label class="form-label">${f.label}${f.required ? ' *' : ''}</label>
+          <select class="form-input" name="${f.key}" data-name="${f.key}">
+            ${f.options.map(o => `<option value="${o.value}" ${val === o.value ? 'selected' : ''}>${o.label}</option>`).join('')}
+          </select>
+        </div>
+      `
+    }
     return `
       <div class="form-group">
         <label class="form-label">${f.label}${f.required ? ' *' : ''}</label>
@@ -379,7 +403,7 @@ async function openConfigDialog(pid, page, state) {
   const collectForm = () => {
     const obj = {}
     reg.fields.forEach(f => {
-      const el = modal.querySelector(`input[name="${f.key}"]`)
+      const el = modal.querySelector(`input[name="${f.key}"]`) || modal.querySelector(`select[name="${f.key}"]`)
       if (el) obj[f.key] = el.value.trim()
     })
     return obj
@@ -495,7 +519,18 @@ async function openConfigDialog(pid, page, state) {
     try {
       // 如果需要安装插件，先安装并显示日志
       if (reg.pluginRequired) {
-        const pluginId = reg.pluginId || pid
+        // 飞书特殊处理：根据用户选择的插件版本决定安装包
+        let pluginPackage = reg.pluginRequired
+        let pluginId = reg.pluginId || pid
+        if (pid === 'feishu') {
+          const pluginVersionField = modal.querySelector('[data-name="pluginVersion"]')
+          const pluginVersion = pluginVersionField?.value || 'builtin'
+          localStorage.setItem('clawpanel-feishu-plugin-version', pluginVersion)
+          if (pluginVersion === 'official') {
+            pluginPackage = '@larksuiteoapi/feishu-openclaw-plugin'
+            pluginId = 'feishu-openclaw-plugin'
+          }
+        }
         const pluginStatus = await api.getChannelPluginStatus(pluginId)
         // 跳过安装：插件已安装 或 已内置（新版 OpenClaw 内置了 feishu 等插件）
         if (!pluginStatus?.installed && !pluginStatus?.builtin) {
@@ -534,7 +569,7 @@ async function openConfigDialog(pid, page, state) {
             if (pid === 'qqbot') {
               await api.installQqbotPlugin()
             } else {
-              await api.installChannelPlugin(reg.pluginRequired, pluginId)
+              await api.installChannelPlugin(pluginPackage, pluginId)
             }
           } catch (e) {
             toast('插件安装失败: ' + e, 'error')

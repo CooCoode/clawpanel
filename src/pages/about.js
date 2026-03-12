@@ -41,9 +41,13 @@ export async function render() {
       <div class="config-section-title">快捷链接</div>
       <div id="links-list"></div>
     </div>
+    <div class="config-section">
+      <div class="config-section-title">关于我们</div>
+      <div id="company-section"></div>
+    </div>
     <div class="config-section" style="color:var(--text-tertiary);font-size:var(--font-size-xs)">
       <p>ClawPanel 基于 Tauri v2 构建，前端 Vanilla JS + Vite，后端 Rust。</p>
-      <p style="margin-top:8px">MIT License &copy; 2026 qingchencloud</p>
+      <p style="margin-top:8px">MIT License &copy; 2026 武汉晴辰天下网络科技有限公司</p>
     </div>
   `
 
@@ -52,6 +56,7 @@ export async function render() {
   renderProjects(page)
   renderContribute(page)
   renderLinks(page)
+  renderCompany(page)
   return page
 }
 
@@ -470,7 +475,7 @@ const PROJECTS = [
   },
   {
     name: 'OpenClaw-zh',
-    desc: 'AI Agent 框架，支持多模型协作、工具调用、记忆管理-中文优化版',
+    desc: '我们维护的 OpenClaw 汉化版，3000+ Star，中文界面 + 国内镜像优化',
     url: 'https://github.com/1186258278/OpenClawChineseTranslation',
   },
   {
@@ -539,4 +544,40 @@ function renderLinks(page) {
   el.innerHTML = `<div style="display:flex;flex-wrap:wrap;gap:var(--space-sm)">
     ${LINKS.map(l => `<a class="btn ${l.primary ? 'btn-primary' : 'btn-secondary'} btn-sm" href="${l.url}" target="_blank" rel="noopener">${l.label}</a>`).join('')}
   </div>`
+}
+
+function renderCompany(page) {
+  const el = page.querySelector('#company-section')
+  el.innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:12px">
+      <div style="display:flex;align-items:center;gap:12px">
+        <img src="/images/logo-brand.png" alt="晴辰云" style="width:40px;height:40px;border-radius:10px;flex-shrink:0">
+        <div>
+          <div style="font-weight:700;font-size:var(--font-size-md)">武汉晴辰天下网络科技有限公司</div>
+          <div style="font-size:var(--font-size-sm);color:var(--text-secondary)">QingchenCloud</div>
+        </div>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;font-size:var(--font-size-sm)">
+        <div style="padding:12px;border-radius:var(--radius-md);border:1px solid var(--border-primary);background:var(--bg-secondary)">
+          <div style="color:var(--text-tertiary);font-size:var(--font-size-xs);margin-bottom:4px">官方网站</div>
+          <a href="https://qingchencloud.com" target="_blank" rel="noopener" style="color:var(--accent)">qingchencloud.com</a>
+        </div>
+        <div style="padding:12px;border-radius:var(--radius-md);border:1px solid var(--border-primary);background:var(--bg-secondary)">
+          <div style="color:var(--text-tertiary);font-size:var(--font-size-xs);margin-bottom:4px">产品官网</div>
+          <a href="https://claw.qt.cool" target="_blank" rel="noopener" style="color:var(--accent)">claw.qt.cool</a>
+        </div>
+        <div style="padding:12px;border-radius:var(--radius-md);border:1px solid var(--border-primary);background:var(--bg-secondary)">
+          <div style="color:var(--text-tertiary);font-size:var(--font-size-xs);margin-bottom:4px">开源仓库</div>
+          <a href="https://github.com/qingchencloud" target="_blank" rel="noopener" style="color:var(--accent)">github.com/qingchencloud</a>
+        </div>
+        <div style="padding:12px;border-radius:var(--radius-md);border:1px solid var(--border-primary);background:var(--bg-secondary)">
+          <div style="color:var(--text-tertiary);font-size:var(--font-size-xs);margin-bottom:4px">商务合作</div>
+          <span style="color:var(--text-primary)">请通过官网联系我们</span>
+        </div>
+      </div>
+      <div style="font-size:var(--font-size-xs);color:var(--text-tertiary);line-height:1.6">
+        我们是 OpenClaw 汉化版（3000+ Star）和 ClawPanel 的作者团队。日常做 AI Agent 相关的产品和开源工具，也接企业私有化部署、定制开发之类的活儿。有事直接群里找我们就行。
+      </div>
+    </div>
+  `
 }

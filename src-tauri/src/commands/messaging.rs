@@ -416,8 +416,11 @@ pub async fn save_messaging_platform(
     // 写回配置并重载 Gateway
     super::config::save_openclaw_json(&cfg)?;
 
-    // 触发 Gateway 重载使配置生效
-    let _ = super::config::do_reload_gateway(&app).await;
+    // Gateway 重载在后台进行，不阻塞 UI 响应
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = super::config::do_reload_gateway(&app2).await;
+    });
 
     Ok(json!({ "ok": true }))
 }
@@ -436,7 +439,11 @@ pub async fn remove_messaging_platform(
     }
 
     super::config::save_openclaw_json(&cfg)?;
-    let _ = super::config::do_reload_gateway(&app).await;
+    // Gateway 重载在后台进行，不阻塞 UI 响应
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = super::config::do_reload_gateway(&app2).await;
+    });
 
     Ok(json!({ "ok": true }))
 }
@@ -462,7 +469,11 @@ pub async fn toggle_messaging_platform(
     }
 
     super::config::save_openclaw_json(&cfg)?;
-    let _ = super::config::do_reload_gateway(&app).await;
+    // Gateway 重载在后台进行，不阻塞 UI 响应
+    let app2 = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = super::config::do_reload_gateway(&app2).await;
+    });
 
     Ok(json!({ "ok": true }))
 }
@@ -519,6 +530,9 @@ pub async fn get_channel_plugin_status(plugin_id: String) -> Result<Value, Strin
     let installed = plugin_dir.is_dir() && plugin_install_marker_exists(&plugin_dir);
     let legacy_backup_detected = legacy_plugin_backup_dir(plugin_id).exists();
 
+    // 检测插件是否为 OpenClaw 内置（新版 openclaw/openclaw-zh 打包了 feishu 等插件）
+    let builtin = is_plugin_builtin(plugin_id);
+
     let cfg = super::config::load_openclaw_json().unwrap_or_else(|_| json!({}));
     let allowed = cfg
         .get("plugins")
@@ -536,6 +550,7 @@ pub async fn get_channel_plugin_status(plugin_id: String) -> Result<Value, Strin
 
     Ok(json!({
         "installed": installed,
+        "builtin": builtin,
         "path": plugin_dir.to_string_lossy(),
         "allowed": allowed,
         "enabled": enabled,
@@ -881,6 +896,50 @@ fn cleanup_failed_qqbot_install(
     Ok(())
 }
 
+/// 检测插件是否为 OpenClaw 内置（作为 npm 依赖打包在 openclaw/openclaw-zh 中）
+fn is_plugin_builtin(plugin_id: &str) -> bool {
+    // 插件 ID → npm 包名映射
+    let pkg_name = match plugin_id {
+        "feishu" => "@openclaw/feishu",
+        "dingtalk-connector" => "@dingtalk-real-ai/dingtalk-connector",
+        _ => return false,
+    };
+    // 在全局 npm node_modules 中查找 openclaw 安装目录
+    let npm_dirs: Vec<PathBuf> = {
+        let mut dirs = Vec::new();
+        #[cfg(target_os = "windows")]
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            let base = PathBuf::from(appdata).join("npm").join("node_modules");
+            dirs.push(base.join("@qingchencloud").join("openclaw-zh"));
+            dirs.push(base.join("openclaw"));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            dirs.push(PathBuf::from("/opt/homebrew/lib/node_modules/@qingchencloud/openclaw-zh"));
+            dirs.push(PathBuf::from("/opt/homebrew/lib/node_modules/openclaw"));
+            dirs.push(PathBuf::from("/usr/local/lib/node_modules/@qingchencloud/openclaw-zh"));
+            dirs.push(PathBuf::from("/usr/local/lib/node_modules/openclaw"));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            dirs.push(PathBuf::from("/usr/local/lib/node_modules/@qingchencloud/openclaw-zh"));
+            dirs.push(PathBuf::from("/usr/local/lib/node_modules/openclaw"));
+            dirs.push(PathBuf::from("/usr/lib/node_modules/@qingchencloud/openclaw-zh"));
+            dirs.push(PathBuf::from("/usr/lib/node_modules/openclaw"));
+        }
+        dirs
+    };
+    // 插件包名拆分成路径片段，如 @openclaw/feishu → @openclaw/feishu
+    let pkg_path: PathBuf = pkg_name.split('/').collect();
+    for base in &npm_dirs {
+        let candidate = base.join("node_modules").join(&pkg_path);
+        if candidate.join("package.json").is_file() {
+            return true;
+        }
+    }
+    false
+}
+
 fn generic_plugin_dir(plugin_id: &str) -> PathBuf {
     super::openclaw_dir().join("extensions").join(plugin_id)
 }
@@ -1117,10 +1176,13 @@ pub async fn install_qqbot_plugin(app: tauri::AppHandle) -> Result<String, Strin
 
     let stderr = child.stderr.take();
     let app2 = app.clone();
+    let qqbot_stderr_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let qqbot_stderr_clone = qqbot_stderr_lines.clone();
     let handle = std::thread::spawn(move || {
         if let Some(pipe) = stderr {
             for line in BufReader::new(pipe).lines().map_while(Result::ok) {
                 let _ = app2.emit("plugin-log", &line);
+                qqbot_stderr_clone.lock().unwrap().push(line);
             }
         }
     });
@@ -1128,9 +1190,11 @@ pub async fn install_qqbot_plugin(app: tauri::AppHandle) -> Result<String, Strin
     let _ = app.emit("plugin-progress", 30);
 
     let mut progress = 30;
+    let mut qqbot_stdout_lines = Vec::new();
     if let Some(pipe) = child.stdout.take() {
         for line in BufReader::new(pipe).lines().map_while(Result::ok) {
             let _ = app.emit("plugin-log", &line);
+            qqbot_stdout_lines.push(line);
             if progress < 90 {
                 progress += 10;
                 let _ = app.emit("plugin-progress", progress);
@@ -1144,6 +1208,26 @@ pub async fn install_qqbot_plugin(app: tauri::AppHandle) -> Result<String, Strin
     let status = child
         .wait()
         .map_err(|e| format!("等待安装进程失败: {}", e))?;
+
+    // 检测 native binding 缺失（macOS/Linux 上 OpenClaw CLI 自身启动失败）
+    let all_output = {
+        let stderr_guard = qqbot_stderr_lines.lock().unwrap();
+        let mut combined = qqbot_stdout_lines.join("\n");
+        combined.push('\n');
+        combined.push_str(&stderr_guard.join("\n"));
+        combined
+    };
+    if all_output.contains("native binding") || all_output.contains("Failed to start CLI") {
+        let _ = app.emit("plugin-log", "");
+        let _ = app.emit("plugin-log", "⚠️ 检测到 OpenClaw CLI 原生依赖问题（native binding 缺失）");
+        let _ = app.emit("plugin-log", "这是 OpenClaw 的上游依赖问题，非 QQBot 插件本身的问题。");
+        let _ = app.emit("plugin-log", "请在终端手动执行以下命令重装 OpenClaw：");
+        let _ = app.emit("plugin-log", "  npm i -g @qingchencloud/openclaw-zh@latest --registry https://registry.npmmirror.com");
+        let _ = app.emit("plugin-log", "重装完成后再回来安装 QQBot 插件。");
+        let _ = cleanup_failed_qqbot_install(had_existing_plugin, had_existing_config);
+        let _ = app.emit("plugin-progress", 100);
+        return Err("OpenClaw CLI 原生依赖缺失，请先在终端重装 OpenClaw（详见上方日志）".into());
+    }
 
     let finalize = (|| -> Result<(), String> {
         if !status.success() {

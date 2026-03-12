@@ -307,19 +307,43 @@ sudo firewall-cmd --reload
 ### 更新 ClawPanel
 
 ```bash
-cd /opt/clawpanel
+cd /opt/clawpanel        # root 部署路径
+# 或 ~/.local/share/clawpanel  # 普通用户路径
+
 git pull origin main
-npm install
+npm install --registry https://registry.npmmirror.com
 sudo systemctl restart clawpanel  # 或 pm2 restart clawpanel
 ```
 
+> 国内拉不到 GitHub？用 Gitee 镜像：
+> ```bash
+> git remote set-url origin https://gitee.com/QtCodeCreators/clawpanel.git
+> git pull origin main
+> ```
+
 ### 更新 OpenClaw
 
+**方式一：在 ClawPanel 面板中操作**（推荐）
+
+打开「关于」页面 → 点击「检查更新」→ 按提示升级。面板会自动处理 sudo 权限和镜像源。
+
+**方式二：命令行手动升级**
+
 ```bash
-npm install -g @qingchencloud/openclaw-zh@latest --registry https://registry.npmmirror.com
+# 非 root 用户需要 sudo
+sudo npm install -g @qingchencloud/openclaw-zh@latest --registry https://registry.npmmirror.com
+
+# 淘宝源安装失败？换官方源重试（可能需要翻墙或代理）
+sudo npm install -g @qingchencloud/openclaw-zh@latest --registry https://registry.npmjs.org
 ```
 
-或在 ClawPanel 面板中点击「检查更新」按钮。
+> **权限说明**：Linux 全局 npm 包安装需要 root 权限。ClawPanel v0.8.1+ 已自动检测非 root 用户并加 sudo。如仍遇权限问题，手动加 `sudo` 即可。
+
+### 更新频率
+
+- **ClawPanel**：`git pull` 获取最新代码，无需重新安装依赖（除非 package.json 变了）
+- **OpenClaw**：通过 npm 全局升级，面板会自动检测新版本并提示
+- **前端热更新**：面板支持前端热更新（不需要 git pull），在「关于」页面点击「热更新」按钮即可
 
 ---
 

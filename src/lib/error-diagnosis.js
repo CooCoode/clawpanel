@@ -15,20 +15,36 @@ export function diagnoseInstallError(errStr) {
   // ===== 1. Git 相关 =====
 
   // git SSH 权限问题（有 git 但没配 SSH Key）
-  if (s.includes('permission denied (publickey)') || s.includes('ssh://git@github')) {
+  if (s.includes('permission denied (publickey)') || s.includes('ssh://git@github') || s.includes('git@github.com')) {
     return {
       title: '安装失败 — Git SSH 权限',
       hint: '依赖包用了 SSH 协议拉取代码，但你没配 GitHub SSH Key。运行以下命令改用 HTTPS：',
-      command: 'git config --global url."https://github.com/".insteadOf ssh://git@github.com/',
+      command: 'git config --global url."https://github.com/".insteadOf ssh://git@github.com/ && git config --global --add url."https://github.com/".insteadOf git@github.com: && git config --global --add url."https://github.com/".insteadOf git://github.com/',
     }
   }
 
-  // git 未安装（exit 128 + access rights）
-  if (s.includes('code 128') || s.includes('exit 128') || s.includes('access rights')) {
+  // git exit 128：优先判断是 SSH 失败还是 Git 未安装
+  if (s.includes('code 128') || s.includes('exit 128')) {
+    if (s.includes('ssh') || s.includes('git@') || s.includes('publickey') || s.includes('access rights')) {
+      return {
+        title: '安装失败 — Git SSH 权限',
+        hint: '依赖包用了 SSH 协议拉取代码，但你没配 GitHub SSH Key。运行以下命令改用 HTTPS：',
+        command: 'git config --global url."https://github.com/".insteadOf ssh://git@github.com/ && git config --global --add url."https://github.com/".insteadOf git@github.com: && git config --global --add url."https://github.com/".insteadOf git://github.com/',
+      }
+    }
     return {
-      title: '安装失败 — 需要安装 Git',
-      hint: '部分依赖需要通过 Git 下载。请先安装 Git 后重试。',
-      command: '下载 Git: https://git-scm.com/downloads',
+      title: '安装失败 — Git 错误',
+      hint: 'Git 操作返回错误（exit 128）。可能是 Git 未安装，或 SSH 认证失败。请确认 Git 已安装，或手动执行以下命令切换到 HTTPS 模式：',
+      command: 'git config --global url."https://github.com/".insteadOf ssh://git@github.com/ && git config --global --add url."https://github.com/".insteadOf git@github.com:',
+    }
+  }
+
+  // native binding 缺失（macOS/Linux 上 OpenClaw 的原生依赖问题）
+  if (s.includes('cannot find native binding') || s.includes('native binding')) {
+    return {
+      title: '安装失败 — 原生依赖缺失',
+      hint: 'OpenClaw 的原生模块未正确安装。这通常是 npm optional dependencies 的 bug。请尝试在终端手动重装：',
+      command: 'npm i -g @qingchencloud/openclaw-zh@latest --registry https://registry.npmmirror.com',
     }
   }
 

@@ -9,21 +9,13 @@ import { showConfirm } from '../components/modal.js'
 import { api } from '../lib/tauri-api.js'
 import { OPENCLAW_KB } from '../lib/openclaw-kb.js'
 import { icon, statusIcon } from '../lib/icons.js'
+import { QTCOOL, PROVIDER_PRESETS, API_TYPES as SHARED_API_TYPES, fetchQtcoolModels } from '../lib/model-presets.js'
 
 // ── 常量 ──
 const STORAGE_KEY = 'clawpanel-assistant'
 const SESSIONS_KEY = 'clawpanel-assistant-sessions'
 const MAX_SESSIONS = 50
 const MAX_CONTEXT_TOKENS = 30 // 最近 N 条消息作为上下文
-
-// ── gpt.qt.cool 推广配置 ──
-const QTCOOL = {
-  baseUrl: 'https://gpt.qt.cool/v1',
-  defaultKey: 'sk-0JDu7hyc51ZKD4iNebpFu07EUEhXmVVc',
-  site: 'https://gpt.qt.cool/',
-  usageUrl: 'https://gpt.qt.cool/user?key=',
-  models: []  // 始终从 API 动态获取最新模型列表
-}
 
 // ── 图片文件存储（通过 Tauri 后端持久化到 ~/.openclaw/clawpanel/images/）──
 async function saveImageToFile(id, dataUrl) {
@@ -53,12 +45,8 @@ const MODES = {
 }
 const DEFAULT_MODE = 'execute'
 
-// ── API 类型 ──
-const API_TYPES = [
-  { value: 'openai-completions', label: 'OpenAI 兼容 (最常用)' },
-  { value: 'anthropic-messages', label: 'Anthropic 原生' },
-  { value: 'google-gemini', label: 'Google Gemini' },
-]
+// ── API 类型（从共享模块导入）──
+const API_TYPES = SHARED_API_TYPES
 
 function normalizeApiType(raw) {
   const type = (raw || '').trim()
@@ -1445,11 +1433,8 @@ function cleanBaseUrl(raw, apiType) {
     // Gemini: https://generativelanguage.googleapis.com/v1beta
     return base
   }
-  if (/:(11434)$/i.test(base)) return `${base}/v1`
-  if (!base.endsWith('/v1')) {
-    if (/\/v1\/.+/.test(base)) base = base.replace(/\/v1\/.*$/, '/v1')
-    else base += '/v1'
-  }
+  if (/:(11434)$/i.test(base) && !base.endsWith('/v1')) return `${base}/v1`
+  // 不再强制追加 /v1，尊重用户填写的 URL（火山引擎等第三方用 /v3 等路径）
   return base
 }
 
@@ -2534,6 +2519,12 @@ function showSettings() {
       <div class="modal-body">
       <div class="ast-settings-form">
         <div class="ast-tab-panel active" data-panel="api">
+          <div class="form-group" style="margin-bottom:8px">
+            <label class="form-label">快捷选择</label>
+            <div id="ast-provider-presets" style="display:flex;flex-wrap:wrap;gap:6px">
+              ${PROVIDER_PRESETS.map(p => `<button class="btn btn-sm btn-secondary ast-preset-btn" data-key="${p.key}" data-url="${escHtml(p.baseUrl)}" data-api="${p.api}" style="font-size:12px;padding:3px 10px">${p.label}</button>`).join('')}
+            </div>
+          </div>
           <div style="display:flex;gap:10px">
             <div class="form-group" style="flex:1">
               <label class="form-label">API Base URL</label>
@@ -2732,11 +2723,23 @@ function showSettings() {
     })
   })
 
-  // API 类型切换时更新提示文本和 placeholder
+  // 服务商快捷预设按钮
   const apiTypeSelect = overlay.querySelector('#ast-apitype')
   const apiHintEl = overlay.querySelector('#ast-api-hint')
   const baseUrlInput = overlay.querySelector('#ast-baseurl')
   const apiKeyInput = overlay.querySelector('#ast-apikey')
+  overlay.querySelectorAll('.ast-preset-btn').forEach(btn => {
+    btn.onclick = () => {
+      baseUrlInput.value = btn.dataset.url
+      apiTypeSelect.value = btn.dataset.api
+      apiTypeSelect.dispatchEvent(new Event('change'))
+      // 高亮选中
+      overlay.querySelectorAll('.ast-preset-btn').forEach(b => b.style.opacity = '0.5')
+      btn.style.opacity = '1'
+    }
+  })
+
+  // API 类型切换时更新提示文本和 placeholder
   apiTypeSelect.addEventListener('change', () => {
     const v = normalizeApiType(apiTypeSelect.value)
     apiHintEl.textContent = apiHintText(v)
@@ -2924,21 +2927,9 @@ function showSettings() {
   const qtcoolKeyInput = overlay.querySelector('#ast-qtcool-key')
   const qtcoolUsageLink = overlay.querySelector('#ast-qtcool-usage')
 
-  // 动态获取模型列表
+  // 动态获取模型列表（共享逻辑）
   ;(async () => {
-    let models = QTCOOL.models // fallback
-    try {
-      const resp = await fetch(QTCOOL.baseUrl + '/models', {
-        headers: { 'Authorization': 'Bearer ' + QTCOOL.defaultKey },
-        signal: AbortSignal.timeout(8000)
-      })
-      if (resp.ok) {
-        const data = await resp.json()
-        if (data.data && data.data.length) {
-          models = data.data.map(m => ({ id: m.id, name: m.id })).sort((a, b) => b.id.localeCompare(a.id))
-        }
-      }
-    } catch { /* use fallback */ }
+    const models = await fetchQtcoolModels()
     qtcoolModelSelect.innerHTML = models.map((m, i) =>
       `<option value="${m.id}" style="color:#333"${i === 0 ? ' selected' : ''}>${m.name || m.id}${i === 0 ? ' ★' : ''}</option>`
     ).join('')

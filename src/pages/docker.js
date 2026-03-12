@@ -190,7 +190,11 @@ async function loadClusterOverview(page) {
     const detail = page.querySelector('#infra-detail')
     if (detail) detail.textContent = `${nodes.length} 节点 · ${runningContainers} 运行 / ${totalContainers} 总计`
   } catch (e) {
-    page.querySelector('#cluster-stats').innerHTML = `<span class="cluster-stat" style="color:var(--error,#ef4444)">${icon('x-circle', 12)} Docker 未连接: ${esc(e.message)}</span>`
+    const errMsg = String(e.message || e)
+    // 后端未运行（Tauri 桌面版不含 Docker 后端，或 Web 模式后端未启动）
+    const isBackendMissing = errMsg.includes('后端服务未运行') || errMsg.includes('is not valid JSON') || errMsg.includes('<!DOCTYPE')
+    const displayMsg = isBackendMissing ? 'Docker 管理后端未运行' : errMsg
+    page.querySelector('#cluster-stats').innerHTML = `<span class="cluster-stat" style="color:var(--error,#ef4444)">${icon('x-circle', 12)} Docker 未连接: ${esc(displayMsg)}</span>`
 
     // ClawPanel 自身运行在 Docker 容器中时，显示容器内专属指引
     if (isInDocker()) {
@@ -210,6 +214,31 @@ async function loadClusterOverview(page) {
               <li>重启容器后回到本页面点击「刷新」</li>
             </ol>
             <div style="margin-top:8px;font-size:12px;color:var(--text-tertiary)">龙虾军团功能用于在宿主机上部署和管理多个 OpenClaw 容器实例</div>
+          </div>
+        </div>
+      `
+      page.querySelector('#docker-nodes').innerHTML = ''
+      page.querySelector('#docker-containers').innerHTML = ''
+      return
+    }
+
+    // 后端缺失时显示专属指引（桌面版需要 Web 部署模式）
+    if (isBackendMissing) {
+      page.querySelector('#workers-grid').innerHTML = `
+        <div class="docker-empty">
+          <div class="docker-empty-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="48" height="48"><rect x="1" y="11" width="4" height="3" rx=".5"/><rect x="6" y="11" width="4" height="3" rx=".5"/><rect x="11" y="11" width="4" height="3" rx=".5"/><rect x="6" y="7" width="4" height="3" rx=".5"/><rect x="11" y="7" width="4" height="3" rx=".5"/><rect x="16" y="11" width="4" height="3" rx=".5"/><rect x="11" y="3" width="4" height="3" rx=".5"/><path d="M2 17c1 3 4 5 10 5s9-2 10-5"/></svg>
+          </div>
+          <div class="docker-empty-title">龙虾军团需要 Web 部署模式</div>
+          <div class="docker-empty-desc">Docker 容器管理功能需要 ClawPanel Web 后端支持。桌面版暂不内置 Docker 管理后端。</div>
+          <div class="docker-guide-section">
+            <div class="docker-guide-title">${icon('info', 14)} 如何使用龙虾军团</div>
+            <ol>
+              <li>使用 Docker 部署 ClawPanel Web 版（推荐）：<code style="font-size:11px">docker run -d -p 3000:3000 -v /var/run/docker.sock:/var/run/docker.sock ghcr.io/qingchencloud/openclaw:latest</code></li>
+              <li>或使用开发模式启动：<code style="font-size:11px">npm run dev</code>，后端会自动启动 Docker 管理服务</li>
+              <li>确保 Docker Desktop 已安装并运行</li>
+            </ol>
+            <div style="margin-top:8px;font-size:12px;color:var(--text-tertiary)">桌面版的 Docker 管理功能正在开发中，敬请期待后续版本更新。</div>
           </div>
         </div>
       `

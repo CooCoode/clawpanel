@@ -42,6 +42,7 @@ fn get_configured_registry() -> String {
 
 /// 创建使用配置源的 npm Command
 /// Windows 上 npm 是 npm.cmd，需要通过 cmd /c 调用，并隐藏窗口
+/// Linux 非 root 用户全局安装需要 sudo
 fn npm_command() -> Command {
     let registry = get_configured_registry();
     #[cfg(target_os = "windows")]
@@ -53,10 +54,26 @@ fn npm_command() -> Command {
         cmd.creation_flags(CREATE_NO_WINDOW);
         cmd
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "macos")]
     {
         let mut cmd = Command::new("npm");
         cmd.args(["--registry", &registry]);
+        cmd.env("PATH", super::enhanced_path());
+        cmd
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Linux 非 root 用户全局 npm install 需要 sudo
+        let need_sudo = unsafe { libc::geteuid() } != 0;
+        let mut cmd = if need_sudo {
+            let mut c = Command::new("sudo");
+            c.args(["npm", "--registry", &registry]);
+            c
+        } else {
+            let mut c = Command::new("npm");
+            c.args(["--registry", &registry]);
+            c
+        };
         cmd.env("PATH", super::enhanced_path());
         cmd
     }
@@ -611,24 +628,28 @@ pub async fn upgrade_openclaw(
     let old_pkg = npm_package_name(&current_source);
     let need_uninstall_old = current_source != source;
 
-    // 自动配置 git 使用 HTTPS 替代 SSH，避免用户没配 SSH Key 导致依赖安装失败
+    // 自动配置 git 全面使用 HTTPS 替代 SSH/git 协议，避免用户没配 SSH Key 导致依赖安装失败
     let _ = app.emit("upgrade-log", "配置 Git HTTPS 模式...");
+    // 先清除旧的 insteadOf 规则，再逐条添加（git config 不带 --add 会覆盖，只保留最后一条）
     let _ = Command::new("git")
-        .args([
-            "config",
-            "--global",
-            "url.https://github.com/.insteadOf",
-            "ssh://git@github.com/",
-        ])
+        .args(["config", "--global", "--unset-all", "url.https://github.com/.insteadOf"])
         .output();
-    let _ = Command::new("git")
-        .args([
-            "config",
-            "--global",
-            "url.https://github.com/.insteadOf",
-            "git@github.com:",
-        ])
-        .output();
+    for from in &[
+        "ssh://git@github.com/",
+        "git@github.com:",
+        "git://github.com/",
+        "git+ssh://git@github.com/",
+    ] {
+        let _ = Command::new("git")
+            .args([
+                "config",
+                "--global",
+                "--add",
+                "url.https://github.com/.insteadOf",
+                from,
+            ])
+            .output();
+    }
 
     let _ = app.emit("upgrade-log", format!("$ npm install -g {pkg}"));
     let _ = app.emit("upgrade-progress", 10);
@@ -651,6 +672,8 @@ pub async fn upgrade_openclaw(
 
     let mut child = npm_command()
         .args(["install", "-g", &pkg, "--registry", registry, "--verbose"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o StrictHostKeyChecking=no")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -695,20 +718,66 @@ pub async fn upgrade_openclaw(
             .code()
             .map(|c| c.to_string())
             .unwrap_or("unknown".into());
-        let _ = app.emit("upgrade-log", format!("❌ 升级失败 (exit code: {code})"));
-        // 把 stderr 最后 15 行带进错误消息，确保前端诊断函数能匹配到
-        // npm 内部错误码（如 -4058 ENOENT、EPERM 等）
-        let tail = stderr_lines
-            .lock()
-            .unwrap()
-            .iter()
-            .rev()
-            .take(15)
-            .rev()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(format!("升级失败，exit code: {code}\n{tail}"));
+
+        // 如果使用了镜像源失败，自动降级到官方源重试
+        let used_mirror = registry.contains("npmmirror.com") || registry.contains("taobao.org");
+        if used_mirror {
+            let _ = app.emit("upgrade-log", "");
+            let _ = app.emit("upgrade-log", "⚠️ 镜像源安装失败，自动切换到官方源重试...");
+            let _ = app.emit("upgrade-progress", 15);
+            let fallback = "https://registry.npmjs.org";
+            let mut child2 = npm_command()
+                .args(["install", "-g", &pkg, "--registry", fallback, "--verbose"])
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes -o StrictHostKeyChecking=no")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("执行重试命令失败: {e}"))?;
+            let stderr2 = child2.stderr.take();
+            let stdout2 = child2.stdout.take();
+            let app3 = app.clone();
+            let stderr_lines3 = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let stderr_lines4 = stderr_lines3.clone();
+            let handle2 = std::thread::spawn(move || {
+                if let Some(pipe) = stderr2 {
+                    let mut p: u32 = 20;
+                    for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                        let _ = app3.emit("upgrade-log", &line);
+                        stderr_lines4.lock().unwrap().push(line);
+                        if p < 75 { p += 2; let _ = app3.emit("upgrade-progress", p); }
+                    }
+                }
+            });
+            if let Some(pipe) = stdout2 {
+                for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                    let _ = app.emit("upgrade-log", &line);
+                }
+            }
+            let _ = handle2.join();
+            let _ = app.emit("upgrade-progress", 80);
+            let status2 = child2.wait().map_err(|e| format!("等待重试进程失败: {e}"))?;
+            let _ = app.emit("upgrade-progress", 100);
+            if !status2.success() {
+                let code2 = status2.code().map(|c| c.to_string()).unwrap_or("unknown".into());
+                let tail = stderr_lines3.lock().unwrap().iter().rev().take(15).rev().cloned().collect::<Vec<_>>().join("\n");
+                return Err(format!("升级失败（镜像源和官方源均失败），exit code: {code2}\n{tail}"));
+            }
+            let _ = app.emit("upgrade-log", "✅ 官方源安装成功");
+        } else {
+            let _ = app.emit("upgrade-log", format!("❌ 升级失败 (exit code: {code})"));
+            let tail = stderr_lines
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .take(15)
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(format!("升级失败，exit code: {code}\n{tail}"));
+        }
     }
 
     // 安装成功后再卸载旧包（确保 CLI 始终可用）
@@ -1307,13 +1376,8 @@ fn normalize_base_url_for_api(raw: &str, api_type: &str) -> String {
         }
         "google-gemini" => base,
         _ => {
-            if !base.ends_with("/v1") {
-                if let Some(idx) = base.find("/v1/") {
-                    base.truncate(idx + 3);
-                } else {
-                    base.push_str("/v1");
-                }
-            }
+            // 不再强制追加 /v1，尊重用户填写的 URL（火山引擎等第三方用 /v3 等路径）
+            // 仅 Ollama (端口 11434) 自动补 /v1
             base
         }
     }
