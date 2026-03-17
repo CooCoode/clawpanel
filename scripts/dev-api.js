@@ -148,6 +148,21 @@ function standaloneInstallDir() {
   return path.join(os.homedir(), '.openclaw-bin')
 }
 
+function standaloneBinPath() {
+  return path.join(standaloneInstallDir(), isWindows ? 'openclaw.cmd' : 'openclaw')
+}
+
+export function buildOpenclawBinCandidatesForUnix(home = homedir()) {
+  return [
+    '/opt/homebrew/bin/openclaw',
+    '/usr/local/bin/openclaw',
+    '/usr/bin/openclaw',
+    '/snap/bin/openclaw',
+    path.join(home, '.local/bin/openclaw'),
+    path.join(home, '.openclaw-bin/openclaw'),
+  ]
+}
+
 async function _tryStandaloneInstall(version, logs, overrideBaseUrl = null) {
   const cfg = standaloneConfig()
   if (!cfg.enabled || !cfg.baseUrl) return false
@@ -1042,12 +1057,7 @@ function findOpenclawBin() {
   } catch {}
 
   const home = homedir()
-  const candidates = [
-    '/usr/local/bin/openclaw',
-    '/usr/bin/openclaw',
-    '/snap/bin/openclaw',
-    path.join(home, '.local/bin/openclaw'),
-  ]
+  const candidates = buildOpenclawBinCandidatesForUnix(home)
 
   // nvm
   const nvmDir = process.env.NVM_DIR || path.join(home, '.nvm')
@@ -1529,11 +1539,12 @@ const handlers = {
       }
 
       let cliInstalled = false
-      if (isMac) {
-        cliInstalled = fs.existsSync('/opt/homebrew/bin/openclaw') || fs.existsSync('/usr/local/bin/openclaw')
-      } else if (isWindows) {
+      if (isWindows) {
         try { cliInstalled = fs.existsSync(path.join(process.env.APPDATA || '', 'npm', 'openclaw.cmd')) }
         catch { cliInstalled = false }
+        if (!cliInstalled) {
+          try { cliInstalled = fs.existsSync(standaloneBinPath()) } catch {}
+        }
       } else {
         cliInstalled = !!findOpenclawBin()
       }
