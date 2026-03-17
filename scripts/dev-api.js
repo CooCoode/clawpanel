@@ -848,8 +848,31 @@ function patchGatewayOrigins() {
 
 // === macOS 服务管理 ===
 
+function runOpenclawCommandSync(args, { cwd = homedir() } = {}) {
+  const bin = findOpenclawBin() || 'openclaw'
+  const out = spawnSync(bin, args, {
+    cwd,
+    encoding: 'utf8',
+    windowsHide: true,
+  })
+  if (out.error) {
+    if (out.error.code === 'ENOENT') throw new Error('openclaw CLI 未安装')
+    throw new Error(out.error.message || String(out.error))
+  }
+  const stdout = String(out.stdout || '').trim()
+  const stderr = String(out.stderr || '').trim()
+  if (out.status !== 0) {
+    throw new Error(stderr || stdout || `命令执行失败: ${bin} ${args.join(' ')}`)
+  }
+  return stdout
+}
+
 function macSleep(seconds = 0.2) {
   execSync(`sleep ${seconds}`)
+}
+
+function macInstallGatewayService() {
+  runOpenclawCommandSync(['gateway', 'install'])
 }
 
 function macStartGatewayDirect(label = 'ai.openclaw.gateway') {
@@ -871,6 +894,30 @@ function macStartGatewayDirect(label = 'ai.openclaw.gateway') {
     cwd: homedir(),
   })
   child.unref()
+}
+
+export function runGatewayMacFallback({
+  hasPlist,
+  installService,
+  startViaService,
+  startDirect,
+}) {
+  if (hasPlist()) {
+    try {
+      startViaService()
+      return 'service'
+    } catch {}
+  } else {
+    try { installService() } catch {}
+    if (hasPlist()) {
+      try {
+        startViaService()
+        return 'service'
+      } catch {}
+    }
+  }
+  startDirect()
+  return 'direct'
 }
 
 export function restartGatewayWithRecovery({
@@ -935,7 +982,16 @@ function macStartService(label) {
       try { execSync(`launchctl kickstart gui/${uid}/${label} 2>&1`) } catch {}
     },
     checkRunning: () => macCheckService(label).running,
-    startFallback: () => macStartGatewayDirect(label),
+    startFallback: () => runGatewayMacFallback({
+      hasPlist: () => fs.existsSync(plistPath),
+      installService: () => macInstallGatewayService(),
+      startViaService: () => {
+        if (!fs.existsSync(plistPath)) throw new Error(`plist 不存在: ${plistPath}`)
+        try { execSync(`launchctl bootstrap gui/${uid} "${plistPath}" 2>&1`) } catch {}
+        execSync(`launchctl kickstart gui/${uid}/${label} 2>&1`)
+      },
+      startDirect: () => macStartGatewayDirect(label),
+    }),
   })
 }
 
@@ -960,7 +1016,16 @@ function macRestartService(label) {
       try { execSync(`launchctl kickstart -k gui/${uid}/${label} 2>&1`) } catch {}
     },
     checkRunning: () => macCheckService(label).running,
-    startFallback: () => macStartGatewayDirect(label),
+    startFallback: () => runGatewayMacFallback({
+      hasPlist: () => fs.existsSync(plistPath),
+      installService: () => macInstallGatewayService(),
+      startViaService: () => {
+        if (!fs.existsSync(plistPath)) throw new Error(`plist 不存在: ${plistPath}`)
+        try { execSync(`launchctl bootstrap gui/${uid} "${plistPath}" 2>&1`) } catch {}
+        execSync(`launchctl kickstart -k gui/${uid}/${label} 2>&1`)
+      },
+      startDirect: () => macStartGatewayDirect(label),
+    }),
   })
 }
 
@@ -3284,8 +3349,8 @@ const handlers = {
 
   // Gateway 安装/卸载
   install_gateway() {
-    try { execSync('openclaw --version 2>&1', { windowsHide: true }) } catch { throw new Error('openclaw CLI 未安装') }
-    return execSync('openclaw gateway install 2>&1', { windowsHide: true }).toString() || 'Gateway 服务已安装'
+    const output = runOpenclawCommandSync(['gateway', 'install'])
+    return output || 'Gateway 服务已安装'
   },
 
   async list_openclaw_versions({ source = 'chinese' } = {}) {
