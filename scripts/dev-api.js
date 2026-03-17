@@ -49,6 +49,11 @@ const GIT_HTTPS_REWRITES = [
   'git://github.com/',
   'git+ssh://git@github.com/'
 ]
+const CHANNEL_PLUGIN_ID_MAP = {
+  qqbot: 'qqbot',
+  feishu: 'feishu',
+  dingtalk: 'dingtalk-connector',
+}
 
 // === 异步任务存储 ===
 const _taskStore = new Map()   // taskId → task object
@@ -1226,6 +1231,83 @@ function findOpenclawBin() {
   return null
 }
 
+function pluginBaseDirs(pluginId) {
+  const pid = String(pluginId || '').trim()
+  if (!pid) return []
+  return [
+    path.join(OPENCLAW_DIR, 'plugins', 'node_modules', pid),
+    path.join(OPENCLAW_DIR, 'extensions', pid),
+  ]
+}
+
+function pluginInstalledByFs(pluginId) {
+  const markers = ['package.json', 'index.ts', 'index.js', 'index.mjs', 'index.cjs']
+  return pluginBaseDirs(pluginId).some((dir) =>
+    markers.some((name) => fs.existsSync(path.join(dir, name))))
+}
+
+function resolveChannelPluginIdForTrust(platform, form = {}) {
+  if (platform === 'feishu') {
+    return form.pluginVersion === 'official' ? 'feishu-openclaw-plugin' : 'feishu'
+  }
+  return CHANNEL_PLUGIN_ID_MAP[platform] || null
+}
+
+export function ensurePluginTrustedConfig(cfg, pluginId) {
+  const pid = String(pluginId || '').trim()
+  if (!pid || !cfg || typeof cfg !== 'object') return false
+
+  let changed = false
+  if (!cfg.plugins || typeof cfg.plugins !== 'object') {
+    cfg.plugins = {}
+    changed = true
+  }
+  if (!Array.isArray(cfg.plugins.allow)) {
+    cfg.plugins.allow = []
+    changed = true
+  }
+  if (!cfg.plugins.allow.includes(pid)) {
+    cfg.plugins.allow.push(pid)
+    changed = true
+  }
+  if (!cfg.plugins.entries || typeof cfg.plugins.entries !== 'object') {
+    cfg.plugins.entries = {}
+    changed = true
+  }
+  const prev = cfg.plugins.entries[pid]
+  const next = (prev && typeof prev === 'object') ? { ...prev, enabled: true } : { enabled: true }
+  if (!prev || prev.enabled !== true) {
+    cfg.plugins.entries[pid] = next
+    changed = true
+  }
+  return changed
+}
+
+export function isPluginAlreadyExistsErrorText(text) {
+  const t = String(text || '').toLowerCase()
+  if (!t) return false
+  if (t.includes('plugin already exists')) return true
+  return t.includes('already exists') && t.includes('plugin')
+}
+
+function installPluginPackage(packageName, { timeout = 120000 } = {}) {
+  const pkg = String(packageName || '').trim()
+  if (!pkg) throw new Error('插件包名不能为空')
+  const bin = findOpenclawBin() || 'openclaw'
+  const out = spawnSync(bin, ['plugins', 'install', pkg], {
+    timeout,
+    cwd: homedir(),
+    encoding: 'utf8',
+  })
+  if (out.error) throw new Error(out.error.message || String(out.error))
+  const stdout = String(out.stdout || '').trim()
+  const stderr = String(out.stderr || '').trim()
+  const combined = `${stdout}\n${stderr}`.trim()
+  if (out.status === 0) return { alreadyExists: false, output: combined }
+  if (isPluginAlreadyExistsErrorText(combined)) return { alreadyExists: true, output: combined }
+  throw new Error(combined || `插件安装失败: ${pkg}`)
+}
+
 function linuxCheckGateway() {
   const port = readGatewayPort()
   // ss 查端口监听
@@ -1785,6 +1867,7 @@ const handlers = {
     const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
     if (!cfg.channels) cfg.channels = {}
     const entry = { enabled: true }
+    const pluginIdForTrust = resolveChannelPluginIdForTrust(platform, form)
     if (platform === 'qqbot') {
       entry.token = `${form.appId}:${form.appSecret}`
     } else if (platform === 'telegram') {
@@ -1807,6 +1890,7 @@ const handlers = {
         if (!cfg.channels.feishu) cfg.channels.feishu = { enabled: true }
         if (!cfg.channels.feishu.accounts) cfg.channels.feishu.accounts = {}
         cfg.channels.feishu.accounts[accountId] = entry
+        ensurePluginTrustedConfig(cfg, pluginIdForTrust)
         fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2))
         return { ok: true }
       }
@@ -1814,6 +1898,7 @@ const handlers = {
       Object.assign(entry, form)
     }
     cfg.channels[platform] = entry
+    ensurePluginTrustedConfig(cfg, pluginIdForTrust)
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2))
     return { ok: true }
   },
@@ -1896,10 +1981,9 @@ const handlers = {
   },
 
   install_qqbot_plugin() {
-    const bin = findOpenclawBin() || 'openclaw'
     try {
-      execSync(`${bin} plugins install @sliverp/qqbot@latest`, { timeout: 60000, cwd: homedir() })
-      return '安装成功'
+      const result = installPluginPackage('@sliverp/qqbot@latest', { timeout: 60000 })
+      return result.alreadyExists ? '插件已存在，已跳过重复安装' : '安装成功'
     } catch (e) {
       throw new Error('QQBot 插件安装失败: ' + (e.message || e))
     }
@@ -1909,7 +1993,8 @@ const handlers = {
     if (!pluginId || !pluginId.trim()) throw new Error('pluginId 不能为空')
     const pid = pluginId.trim()
     const pluginDir = path.join(OPENCLAW_DIR, 'plugins', 'node_modules', pid)
-    const installed = fs.existsSync(pluginDir) && fs.existsSync(path.join(pluginDir, 'package.json'))
+    const extensionDir = path.join(OPENCLAW_DIR, 'extensions', pid)
+    const installed = pluginInstalledByFs(pid)
     // 检测是否为内置插件
     const bin = findOpenclawBin() || 'openclaw'
     let builtin = false
@@ -1925,7 +2010,7 @@ const handlers = {
     const backupDir = path.join(OPENCLAW_DIR, 'plugin-backups', pid)
     const legacyBackup = path.join(OPENCLAW_DIR, 'plugins', 'node_modules', `${pid}.bak`)
     return {
-      installed, builtin, path: pluginDir,
+      installed, builtin, path: installed && fs.existsSync(extensionDir) ? extensionDir : pluginDir,
       allowed, enabled,
       legacyBackupDetected: fs.existsSync(backupDir) || fs.existsSync(legacyBackup),
     }
@@ -1933,10 +2018,9 @@ const handlers = {
 
   install_channel_plugin({ packageName, pluginId }) {
     if (!packageName || !pluginId) throw new Error('packageName 和 pluginId 不能为空')
-    const bin = findOpenclawBin() || 'openclaw'
     try {
-      execSync(`${bin} plugins install ${packageName.trim()}`, { timeout: 120000, cwd: homedir() })
-      return '安装成功'
+      const result = installPluginPackage(packageName.trim(), { timeout: 120000 })
+      return result.alreadyExists ? '插件已存在，已跳过重复安装' : '安装成功'
     } catch (e) {
       throw new Error(`插件 ${pluginId} 安装失败: ` + (e.message || e))
     }
