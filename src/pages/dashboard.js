@@ -5,6 +5,7 @@ import { api } from '../lib/tauri-api.js'
 import { toast } from '../components/toast.js'
 import { onGatewayChange } from '../lib/app-state.js'
 import { navigate } from '../router.js'
+import { normalizeVersionInfo } from '../lib/dashboard-utils.js'
 
 let _unsubGw = null
 
@@ -90,7 +91,7 @@ async function loadDashboardData(page, fullRefresh = false) {
   // 第一波：服务状态 + 配置 + 版本 → 立即渲染统计卡片
   const [servicesRes, configRes, versionRes] = await coreP
   const services = servicesRes.status === 'fulfilled' ? servicesRes.value : []
-  const version = versionRes.status === 'fulfilled' ? versionRes.value : {}
+  const version = versionRes.status === 'fulfilled' ? normalizeVersionInfo(versionRes.value) : {}
   const config = configRes.status === 'fulfilled' ? configRes.value : null
   if (servicesRes.status === 'rejected') toast('服务状态加载失败', 'error')
   if (versionRes.status === 'rejected') toast('版本信息加载失败', 'error')
@@ -143,9 +144,10 @@ function renderStatCards(page, services, version, agents, config) {
   const cardsEl = page.querySelector('#stat-cards')
   const gw = services.find(s => s.label === 'ai.openclaw.gateway')
   const runningCount = services.filter(s => s.running).length
-  const versionMeta = version.recommended
-    ? `${version.ahead_of_recommended ? `当前版本高于推荐稳定版 ${version.recommended}，可能不稳定` : version.is_recommended ? '稳定版 ' + version.recommended : '推荐稳定版 ' + version.recommended}${version.latest_update_available && version.latest ? ' · 最新上游 ' + version.latest : ''}`
-    : (version.latest_update_available && version.latest ? '最新上游: ' + version.latest : '版本信息未获取')
+  const v = normalizeVersionInfo(version)
+  const versionMeta = v.recommended
+    ? `${v.ahead_of_recommended ? `当前版本高于推荐稳定版 ${v.recommended}，可能不稳定` : v.is_recommended ? '稳定版 ' + v.recommended : '推荐稳定版 ' + v.recommended}${v.latest_update_available && v.latest ? ' · 最新上游 ' + v.latest : ''}`
+    : (v.latest_update_available && v.latest ? '最新上游: ' + v.latest : '版本信息未获取')
 
   const defaultAgent = agents.find(a => a.id === 'main')?.name || 'main'
   const modelCount = config?.models?.providers ? Object.values(config.models.providers).reduce((acc, p) => acc + (p.models?.length || 0), 0) : 0
@@ -162,9 +164,9 @@ function renderStatCards(page, services, version, agents, config) {
     </div>
     <div class="stat-card">
       <div class="stat-card-header">
-        <span class="stat-card-label">版本 · ${version.source === 'official' ? '官方' : '汉化'}</span>
+        <span class="stat-card-label">版本 · ${v.source === 'official' ? '官方' : '汉化'}</span>
       </div>
-      <div class="stat-card-value">${version.current || '未知'}</div>
+      <div class="stat-card-value">${v.current || '未知'}</div>
       <div class="stat-card-meta">${versionMeta}</div>
     </div>
     <div class="stat-card">
@@ -467,7 +469,7 @@ function bindActions(page) {
     btnUpdate.disabled = true
     btnUpdate.textContent = '检查中...'
     try {
-      const info = await api.getVersionInfo()
+      const info = normalizeVersionInfo(await api.getVersionInfo())
       if (info.ahead_of_recommended && info.recommended) {
         toast(`当前本地版本 ${info.current || ''} 高于推荐稳定版 ${info.recommended}，可能存在兼容风险`, 'warning')
       } else if (info.update_available && info.recommended) {
