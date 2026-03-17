@@ -62,6 +62,33 @@ export function getQqbotPluginPackageCandidates() {
   return [...QQBOT_PLUGIN_PACKAGE_CANDIDATES]
 }
 
+export function buildQqbotChannelAddArgs(form = {}) {
+  const appId = String(form.appId || '').trim()
+  const appSecret = String(form.appSecret || '').trim()
+  if (!appId || !appSecret) throw new Error('QQ 机器人配置缺少 AppID 或 AppSecret')
+  return ['channels', 'add', '--channel', 'qqbot', '--token', `${appId}:${appSecret}`]
+}
+
+function isChannelAlreadyExistsErrorText(text) {
+  const t = String(text || '').toLowerCase()
+  if (!t) return false
+  return t.includes('already exists') || t.includes('已存在') || t.includes('duplicate')
+}
+
+export function readQqbotFormFromConfigEntry(saved = {}) {
+  const form = {}
+  const token = String(saved?.token || '')
+  if (token) {
+    const [appId, ...rest] = token.split(':')
+    if (appId) form.appId = appId
+    if (rest.length) form.appSecret = rest.join(':')
+  }
+  if (!form.appId && saved?.appId) form.appId = String(saved.appId)
+  const secret = saved?.clientSecret ?? saved?.appSecret
+  if (!form.appSecret && secret) form.appSecret = String(secret)
+  return form
+}
+
 // === 异步任务存储 ===
 const _taskStore = new Map()   // taskId → task object
 const MAX_TASK_HISTORY = 50
@@ -1862,10 +1889,7 @@ const handlers = {
     if (!saved) return { exists: false }
     const form = {}
     if (platform === 'qqbot') {
-      const t = saved.token || ''
-      const [appId, ...rest] = t.split(':')
-      if (appId) form.appId = appId
-      if (rest.length) form.appSecret = rest.join(':')
+      Object.assign(form, readQqbotFormFromConfigEntry(saved))
     } else if (platform === 'telegram') {
       if (saved.botToken) form.botToken = saved.botToken
       if (saved.allowFrom) form.allowedUsers = saved.allowFrom.join(', ')
@@ -1889,11 +1913,37 @@ const handlers = {
     if (!fs.existsSync(CONFIG_PATH)) throw new Error('openclaw.json 不存在')
     const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
     if (!cfg.channels) cfg.channels = {}
-    const entry = { enabled: true }
     const pluginIdForTrust = resolveChannelPluginIdForTrust(platform, form)
     if (platform === 'qqbot') {
-      entry.token = `${form.appId}:${form.appSecret}`
-    } else if (platform === 'telegram') {
+      const addArgs = buildQqbotChannelAddArgs(form)
+      try {
+        runOpenclawCommandSync(addArgs)
+      } catch (e) {
+        const msg = e.message || String(e)
+        if (!isChannelAlreadyExistsErrorText(msg)) {
+          throw new Error('QQ 渠道写入失败: ' + msg)
+        }
+        try { runOpenclawCommandSync(['channels', 'remove', '--channel', 'qqbot']) } catch {}
+        runOpenclawCommandSync(addArgs)
+      }
+
+      let freshCfg = cfg
+      try {
+        freshCfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'))
+      } catch {}
+      if (!freshCfg.channels || typeof freshCfg.channels !== 'object') freshCfg.channels = {}
+      if (!freshCfg.channels.qqbot || typeof freshCfg.channels.qqbot !== 'object') {
+        freshCfg.channels.qqbot = { enabled: true, token: `${form.appId}:${form.appSecret}` }
+      } else if (freshCfg.channels.qqbot.enabled === undefined) {
+        freshCfg.channels.qqbot.enabled = true
+      }
+      ensurePluginTrustedConfig(freshCfg, pluginIdForTrust)
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify(freshCfg, null, 2))
+      return { ok: true }
+    }
+
+    const entry = { enabled: true }
+    if (platform === 'telegram') {
       entry.botToken = form.botToken
       if (form.allowedUsers) entry.allowFrom = form.allowedUsers.split(',').map(s => s.trim()).filter(Boolean)
     } else if (platform === 'discord') {
