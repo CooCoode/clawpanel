@@ -19,14 +19,14 @@ const PLATFORM_REGISTRY = {
       '点击「创建机器人」，设置机器人名称和头像',
       '创建完成后，在机器人详情页复制 <b>AppID</b> 和 <b>AppSecret</b>（AppSecret 仅显示一次，请妥善保存）',
       '将 AppID 和 AppSecret 填入下方表单，点击「校验凭证」验证后保存',
-      'ClawPanel 会自动安装 QQBot 社区插件并写入配置，保存后 Gateway 自动重载生效',
+      'ClawPanel 会自动安装 QQBot 官方插件并写入配置，保存后 Gateway 自动重载生效',
     ],
     guideFooter: '<div style="margin-top:8px;font-size:var(--font-size-xs);color:var(--text-tertiary)">详细教程：<a href="https://cloud.tencent.com/developer/article/2626045" target="_blank" style="color:var(--accent);text-decoration:underline">腾讯云 - 快速搭建 AI 私人 QQ 助理</a></div>',
     fields: [
       { key: 'appId', label: 'AppID', placeholder: '如 1903224859', required: true },
       { key: 'appSecret', label: 'AppSecret', placeholder: '如 cisldqspngYlyPdc', secret: true, required: true },
     ],
-    pluginRequired: '@sliverp/qqbot@latest',
+    pluginRequired: '@tencent-connect/openclaw-qqbot@latest',
   },
   telegram: {
     label: 'Telegram',

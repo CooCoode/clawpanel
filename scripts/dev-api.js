@@ -54,6 +54,13 @@ const CHANNEL_PLUGIN_ID_MAP = {
   feishu: 'feishu',
   dingtalk: 'dingtalk-connector',
 }
+const QQBOT_PLUGIN_PACKAGE_CANDIDATES = [
+  '@tencent-connect/openclaw-qqbot@latest',
+]
+
+export function getQqbotPluginPackageCandidates() {
+  return [...QQBOT_PLUGIN_PACKAGE_CANDIDATES]
+}
 
 // === 异步任务存储 ===
 const _taskStore = new Map()   // taskId → task object
@@ -1981,12 +1988,16 @@ const handlers = {
   },
 
   install_qqbot_plugin() {
-    try {
-      const result = installPluginPackage('@sliverp/qqbot@latest', { timeout: 60000 })
-      return result.alreadyExists ? '插件已存在，已跳过重复安装' : '安装成功'
-    } catch (e) {
-      throw new Error('QQBot 插件安装失败: ' + (e.message || e))
+    const errors = []
+    for (const pkg of getQqbotPluginPackageCandidates()) {
+      try {
+        const result = installPluginPackage(pkg, { timeout: 60000 })
+        return result.alreadyExists ? `插件已存在（${pkg}），已跳过重复安装` : `安装成功（${pkg}）`
+      } catch (e) {
+        errors.push(`${pkg}: ${e.message || e}`)
+      }
     }
+    throw new Error('QQBot 插件安装失败: ' + errors.join(' | '))
   },
 
   get_channel_plugin_status({ pluginId }) {
