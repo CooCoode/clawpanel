@@ -8,6 +8,7 @@ import { toast } from '../components/toast.js'
 import { setUpgrading, isMacPlatform } from '../lib/app-state.js'
 import { diagnoseInstallError } from '../lib/error-diagnosis.js'
 import { icon, statusIcon } from '../lib/icons.js'
+import { parseUpgradeResultForModal } from '../lib/upgrade-result.js'
 
 export async function render() {
   const page = document.createElement('div')
@@ -648,8 +649,10 @@ function bindEvents(page, nodeOk, detectState) {
           modal.appendLog(`设置 npm 镜像源: ${registry}`)
           try { await api.setNpmRegistry(registry) } catch {}
         }
-        const msg = await api.upgradeOpenclaw(source, null, method)
-        modal.setDone(msg)
+        const result = await api.upgradeOpenclaw(source, null, method)
+        const parsed = parseUpgradeResultForModal(result, '安装完成')
+        parsed.logLines.forEach(line => modal.appendLog(line))
+        modal.setDone(parsed.doneMessage)
         toast('OpenClaw 安装成功', 'success')
         setTimeout(() => window.location.reload(), 1500)
         cleanup()
@@ -664,4 +667,3 @@ function bindEvents(page, nodeOk, detectState) {
     }
   })
 }
-

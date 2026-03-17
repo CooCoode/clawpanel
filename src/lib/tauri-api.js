@@ -175,8 +175,14 @@ export const api = {
   reloadGateway: () => invoke('reload_gateway'),
   restartGateway: () => invoke('restart_gateway'),
   listOpenclawVersions: (source = 'chinese') => invoke('list_openclaw_versions', { source }),
-  upgradeOpenclaw: (source = 'chinese', version = null, method = 'auto') => invoke('upgrade_openclaw', { source, version, method }),
-  uninstallOpenclaw: (cleanConfig = false) => invoke('uninstall_openclaw', { cleanConfig }),
+  upgradeOpenclaw: (source = 'chinese', version = null, method = 'auto') => invoke('upgrade_openclaw', { source, version, method }).then((result) => {
+    invalidate('get_version_info', 'check_installation', 'get_services_status', 'get_status_summary')
+    return result
+  }),
+  uninstallOpenclaw: (cleanConfig = false) => invoke('uninstall_openclaw', { cleanConfig }).then((result) => {
+    invalidate('get_version_info', 'check_installation', 'get_services_status', 'get_status_summary')
+    return result
+  }),
   installGateway: () => invoke('install_gateway'),
   uninstallGateway: () => invoke('uninstall_gateway'),
   getNpmRegistry: () => cachedInvoke('get_npm_registry', {}, 30000),

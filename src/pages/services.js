@@ -2,12 +2,13 @@
  * 服务管理页面
  * 服务启停 + 更新检测 + 配置备份管理
  */
-import { api } from '../lib/tauri-api.js'
+import { api, invalidate } from '../lib/tauri-api.js'
 import { toast } from '../components/toast.js'
 import { showConfirm, showUpgradeModal } from '../components/modal.js'
 import { isMacPlatform, isInDocker, setUpgrading, setUserStopped, resetAutoRestart } from '../lib/app-state.js'
 import { diagnoseInstallError } from '../lib/error-diagnosis.js'
 import { icon, statusIcon } from '../lib/icons.js'
+import { parseUpgradeResultForModal } from '../lib/upgrade-result.js'
 
 // HTML 转义，防止 XSS
 function escapeHtml(str) {
@@ -529,6 +530,7 @@ async function doUpgradeWithModal(source, page, version = null, method = 'auto')
       unlistenDone = await listen('upgrade-done', (e) => {
         cleanup()
         modal.setDone(typeof e.payload === 'string' ? e.payload : '操作完成')
+        invalidate('get_version_info', 'check_installation', 'get_services_status', 'get_status_summary')
         loadVersion(page)
       })
 
@@ -554,8 +556,11 @@ async function doUpgradeWithModal(source, page, version = null, method = 'auto')
     } else {
       // Web 模式：仍然同步等待（dev-api 后端没有 spawn）
       modal.appendLog('Web 模式：升级过程日志不可用，请等待完成...')
-      const msg = await api.upgradeOpenclaw(source, version, method)
-      modal.setDone(typeof msg === 'string' ? msg : (msg?.message || '升级完成'))
+      const result = await api.upgradeOpenclaw(source, version, method)
+      const parsed = parseUpgradeResultForModal(result, '升级完成')
+      parsed.logLines.forEach(line => modal.appendLog(line))
+      modal.setDone(parsed.doneMessage)
+      invalidate('get_version_info', 'check_installation', 'get_services_status', 'get_status_summary')
       await loadVersion(page)
       cleanup()
     }

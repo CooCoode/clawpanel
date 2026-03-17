@@ -2,11 +2,12 @@
  * 关于页面
  * 版本信息、项目链接、相关项目、系统环境
  */
-import { api } from '../lib/tauri-api.js'
+import { api, invalidate } from '../lib/tauri-api.js'
 import { toast } from '../components/toast.js'
 import { showUpgradeModal, showConfirm } from '../components/modal.js'
 import { setUpgrading } from '../lib/app-state.js'
 import { icon, statusIcon } from '../lib/icons.js'
+import { parseUpgradeResultForModal } from '../lib/upgrade-result.js'
 
 export async function render() {
   const page = document.createElement('div')
@@ -358,7 +359,10 @@ async function showVersionPicker(page, currentVersion) {
  */
 async function doInstall(page, title, source, version) {
   const modal = showUpgradeModal(title)
-  modal.onClose(() => loadData(page))
+  modal.onClose(() => {
+    invalidate('get_version_info', 'check_installation', 'get_services_status', 'get_status_summary')
+    loadData(page)
+  })
   let unlistenLog, unlistenProgress, unlistenDone, unlistenError
   setUpgrading(true)
 
@@ -376,6 +380,7 @@ async function doInstall(page, title, source, version) {
       unlistenDone = await listen('upgrade-done', (e) => {
         cleanup()
         modal.setDone(typeof e.payload === 'string' ? e.payload : '操作完成')
+        invalidate('get_version_info', 'check_installation', 'get_services_status', 'get_status_summary')
       })
 
       unlistenError = await listen('upgrade-error', async (e) => {
@@ -398,8 +403,11 @@ async function doInstall(page, title, source, version) {
       modal.appendLog('后台任务已启动，请等待完成...')
     } else {
       modal.appendLog('Web 模式：安装过程日志不可用，请等待完成...')
-      const msg = await api.upgradeOpenclaw(source, version)
-      modal.setDone(typeof msg === 'string' ? msg : (msg?.message || '操作完成'))
+      const result = await api.upgradeOpenclaw(source, version)
+      const parsed = parseUpgradeResultForModal(result, '操作完成')
+      parsed.logLines.forEach(line => modal.appendLog(line))
+      modal.setDone(parsed.doneMessage)
+      invalidate('get_version_info', 'check_installation', 'get_services_status', 'get_status_summary')
       cleanup()
     }
   } catch (e) {
