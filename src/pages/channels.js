@@ -27,6 +27,7 @@ const PLATFORM_REGISTRY = {
       { key: 'appSecret', label: 'AppSecret', placeholder: '如 cisldqspngYlyPdc', secret: true, required: true },
     ],
     pluginRequired: '@tencent-connect/openclaw-qqbot@latest',
+    pluginId: 'openclaw-qqbot',
   },
   telegram: {
     label: 'Telegram',

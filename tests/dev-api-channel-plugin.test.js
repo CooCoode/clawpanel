@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { ensurePluginTrustedConfig, isPluginAlreadyExistsErrorText, getQqbotPluginPackageCandidates } from '../scripts/dev-api.js'
+import { ensurePluginTrustedConfig, isPluginAlreadyExistsErrorText, getQqbotPluginPackageCandidates, resolveChannelPluginIdForTrust } from '../scripts/dev-api.js'
 
 test('plugin already exists 文本应识别为可忽略安装错误', () => {
   const text = 'plugin already exists: /Users/r002/.openclaw/extensions/qqbot (delete it first)'
@@ -36,4 +36,8 @@ test('QQ 插件安装包应优先使用腾讯官方包', () => {
   const candidates = getQqbotPluginPackageCandidates()
   assert.ok(Array.isArray(candidates) && candidates.length > 0)
   assert.equal(candidates[0], '@tencent-connect/openclaw-qqbot@latest')
+})
+
+test('QQ 渠道插件信任 ID 应写为 openclaw-qqbot', () => {
+  assert.equal(resolveChannelPluginIdForTrust('qqbot', {}), 'openclaw-qqbot')
 })

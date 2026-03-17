@@ -50,7 +50,7 @@ const GIT_HTTPS_REWRITES = [
   'git+ssh://git@github.com/'
 ]
 const CHANNEL_PLUGIN_ID_MAP = {
-  qqbot: 'qqbot',
+  qqbot: 'openclaw-qqbot',
   feishu: 'feishu',
   dingtalk: 'dingtalk-connector',
 }
@@ -1238,22 +1238,38 @@ function findOpenclawBin() {
   return null
 }
 
-function pluginBaseDirs(pluginId) {
+function pluginIdAliases(pluginId) {
   const pid = String(pluginId || '').trim()
   if (!pid) return []
-  return [
-    path.join(OPENCLAW_DIR, 'plugins', 'node_modules', pid),
-    path.join(OPENCLAW_DIR, 'extensions', pid),
-  ]
+  if (pid === 'openclaw-qqbot' || pid === 'qqbot') return ['openclaw-qqbot', 'qqbot']
+  return [pid]
+}
+
+function pluginBaseDirs(pluginId) {
+  const ids = pluginIdAliases(pluginId)
+  if (!ids.length) return []
+  const dirs = []
+  for (const pid of ids) {
+    dirs.push(path.join(OPENCLAW_DIR, 'plugins', 'node_modules', pid))
+    dirs.push(path.join(OPENCLAW_DIR, 'extensions', pid))
+  }
+  return dirs
+}
+
+function pluginInstalledPath(pluginId) {
+  const dirs = pluginBaseDirs(pluginId)
+  const markers = ['package.json', 'index.ts', 'index.js', 'index.mjs', 'index.cjs']
+  for (const dir of dirs) {
+    if (markers.some((name) => fs.existsSync(path.join(dir, name)))) return dir
+  }
+  return null
 }
 
 function pluginInstalledByFs(pluginId) {
-  const markers = ['package.json', 'index.ts', 'index.js', 'index.mjs', 'index.cjs']
-  return pluginBaseDirs(pluginId).some((dir) =>
-    markers.some((name) => fs.existsSync(path.join(dir, name))))
+  return !!pluginInstalledPath(pluginId)
 }
 
-function resolveChannelPluginIdForTrust(platform, form = {}) {
+export function resolveChannelPluginIdForTrust(platform, form = {}) {
   if (platform === 'feishu') {
     return form.pluginVersion === 'official' ? 'feishu-openclaw-plugin' : 'feishu'
   }
@@ -2004,7 +2020,7 @@ const handlers = {
     if (!pluginId || !pluginId.trim()) throw new Error('pluginId 不能为空')
     const pid = pluginId.trim()
     const pluginDir = path.join(OPENCLAW_DIR, 'plugins', 'node_modules', pid)
-    const extensionDir = path.join(OPENCLAW_DIR, 'extensions', pid)
+    const installedPath = pluginInstalledPath(pid)
     const installed = pluginInstalledByFs(pid)
     // 检测是否为内置插件
     const bin = findOpenclawBin() || 'openclaw'
@@ -2021,7 +2037,7 @@ const handlers = {
     const backupDir = path.join(OPENCLAW_DIR, 'plugin-backups', pid)
     const legacyBackup = path.join(OPENCLAW_DIR, 'plugins', 'node_modules', `${pid}.bak`)
     return {
-      installed, builtin, path: installed && fs.existsSync(extensionDir) ? extensionDir : pluginDir,
+      installed, builtin, path: installedPath || pluginDir,
       allowed, enabled,
       legacyBackupDetected: fs.existsSync(backupDir) || fs.existsSync(legacyBackup),
     }
