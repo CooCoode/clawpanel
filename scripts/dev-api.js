@@ -848,6 +848,52 @@ function patchGatewayOrigins() {
 
 // === macOS 服务管理 ===
 
+function macSleep(seconds = 0.2) {
+  execSync(`sleep ${seconds}`)
+}
+
+function macStartGatewayDirect(label = 'ai.openclaw.gateway') {
+  if (label !== 'ai.openclaw.gateway') {
+    throw new Error(`不支持直接启动服务: ${label}`)
+  }
+  if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR, { recursive: true })
+  const logPath = path.join(LOGS_DIR, 'gateway.log')
+  const errPath = path.join(LOGS_DIR, 'gateway.err.log')
+  const out = fs.openSync(logPath, 'a')
+  const err = fs.openSync(errPath, 'a')
+  const timestamp = new Date().toISOString()
+  fs.appendFileSync(logPath, `\n[${timestamp}] [ClawPanel] Starting Gateway directly on macOS...\n`)
+  const bin = findOpenclawBin() || 'openclaw'
+  const child = spawn(bin, ['gateway'], {
+    detached: true,
+    stdio: ['ignore', out, err],
+    shell: false,
+    cwd: homedir(),
+  })
+  child.unref()
+}
+
+export function restartGatewayWithRecovery({
+  runRestart,
+  checkRunning,
+  startFallback,
+  sleep = () => macSleep(0.2),
+  attempts = 15,
+  errorMessage = 'Gateway 未启动成功。请先执行: openclaw gateway install；或手动执行: openclaw gateway',
+}) {
+  if (typeof runRestart === 'function') runRestart()
+  for (let i = 0; i < attempts; i++) {
+    if (checkRunning()) return true
+    sleep()
+  }
+  if (typeof startFallback === 'function') startFallback()
+  for (let i = 0; i < attempts; i++) {
+    if (checkRunning()) return true
+    sleep()
+  }
+  throw new Error(errorMessage)
+}
+
 function macCheckService(label) {
   try {
     const uid = getUid()
@@ -882,9 +928,15 @@ function macCheckService(label) {
 function macStartService(label) {
   const uid = getUid()
   const plistPath = path.join(homedir(), `Library/LaunchAgents/${label}.plist`)
-  if (!fs.existsSync(plistPath)) throw new Error(`plist 不存在: ${plistPath}`)
-  try { execSync(`launchctl bootstrap gui/${uid} "${plistPath}" 2>&1`) } catch {}
-  try { execSync(`launchctl kickstart gui/${uid}/${label} 2>&1`) } catch {}
+  restartGatewayWithRecovery({
+    runRestart: () => {
+      if (!fs.existsSync(plistPath)) return
+      try { execSync(`launchctl bootstrap gui/${uid} "${plistPath}" 2>&1`) } catch {}
+      try { execSync(`launchctl kickstart gui/${uid}/${label} 2>&1`) } catch {}
+    },
+    checkRunning: () => macCheckService(label).running,
+    startFallback: () => macStartGatewayDirect(label),
+  })
 }
 
 function macStopService(label) {
@@ -895,15 +947,21 @@ function macStopService(label) {
 function macRestartService(label) {
   const uid = getUid()
   const plistPath = path.join(homedir(), `Library/LaunchAgents/${label}.plist`)
-  try { execSync(`launchctl bootout gui/${uid}/${label} 2>&1`) } catch {}
-  // 等待进程退出
-  for (let i = 0; i < 15; i++) {
-    const { running } = macCheckService(label)
-    if (!running) break
-    execSync('sleep 0.2')
-  }
-  try { execSync(`launchctl bootstrap gui/${uid} "${plistPath}" 2>&1`) } catch {}
-  try { execSync(`launchctl kickstart -k gui/${uid}/${label} 2>&1`) } catch {}
+  restartGatewayWithRecovery({
+    runRestart: () => {
+      try { execSync(`launchctl bootout gui/${uid}/${label} 2>&1`) } catch {}
+      for (let i = 0; i < 15; i++) {
+        const { running } = macCheckService(label)
+        if (!running) break
+        macSleep(0.2)
+      }
+      if (!fs.existsSync(plistPath)) return
+      try { execSync(`launchctl bootstrap gui/${uid} "${plistPath}" 2>&1`) } catch {}
+      try { execSync(`launchctl kickstart -k gui/${uid}/${label} 2>&1`) } catch {}
+    },
+    checkRunning: () => macCheckService(label).running,
+    startFallback: () => macStartGatewayDirect(label),
+  })
 }
 
 // === Windows 服务管理 ===

@@ -76,7 +76,12 @@ async function saveConfig() {
     await api.writeOpenclawConfig(_config)
     _dirty = false
     toast('配置已保存，正在重载 Gateway...', 'info')
-    try { await api.reloadGateway(); toast('Gateway 已重载', 'success') } catch {}
+    try {
+      await api.reloadGateway()
+      toast('Gateway 已重载', 'success')
+    } catch (e) {
+      toast('配置已保存，但 Gateway 重载失败: ' + (e?.message || e), 'warning')
+    }
   } catch (e) {
     toast('保存失败: ' + e, 'error')
   } finally {
