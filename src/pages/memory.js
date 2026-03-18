@@ -233,7 +233,7 @@ async function saveFile(page, state) {
   if (!state.currentPath) return
   const content = page.querySelector('#file-editor').value
   try {
-    await api.writeMemoryFile(state.currentPath, content, null, state.agentId)
+    await api.writeMemoryFile(state.currentPath, content, state.category, state.agentId)
     toast('文件已保存', 'success')
   } catch (e) {
     toast('保存失败: ' + e, 'error')
@@ -290,6 +290,23 @@ function triggerDownload(filename, content) {
   URL.revokeObjectURL(url)
 }
 
+function triggerBinaryDownload(filename, data, mimeType = 'application/octet-stream') {
+  const blob = new Blob([data], { type: mimeType })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+function decodeBase64(base64) {
+  const bin = atob(base64 || '')
+  const bytes = new Uint8Array(bin.length)
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
+  return bytes
+}
+
 async function downloadCurrentFile(page, state) {
   if (!state.currentPath) return
   try {
@@ -304,8 +321,17 @@ async function downloadCurrentFile(page, state) {
 
 async function exportZip(state) {
   try {
-    const zipPath = await api.exportMemoryZip(state.category, state.agentId)
+    const result = await api.exportMemoryZip(state.category, state.agentId)
     const label = CATEGORIES.find(c => c.key === state.category)?.label || state.category
+    if (result && typeof result === 'object' && result.dataBase64) {
+      const zipName = result.filename || `openclaw-${state.category}.zip`
+      const bytes = decodeBase64(result.dataBase64)
+      triggerBinaryDownload(zipName, bytes, result.mimeType || 'application/zip')
+      toast(`已导出并下载: ${label} (${zipName})`, 'success')
+      return
+    }
+
+    const zipPath = String(result || '')
     // 尝试用 Tauri shell open 打开文件所在目录
     try {
       const { open } = await import('@tauri-apps/plugin-shell')

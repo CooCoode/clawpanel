@@ -699,6 +699,300 @@ function readBody(req) {
   })
 }
 
+const MEMORY_ALLOWED_EXTS = new Set(['md', 'txt', 'json', 'jsonl'])
+const MEMORY_WORKSPACE_CACHE_TTL_MS = 60 * 1000
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256)
+  for (let i = 0; i < 256; i++) {
+    let c = i
+    for (let j = 0; j < 8; j++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1)
+    table[i] = c >>> 0
+  }
+  return table
+})()
+
+function normalizeMemoryCategory(category) {
+  if (category === 'archive' || category === 'core') return category
+  return 'memory'
+}
+
+function normalizeMemoryAgentId(args = {}) {
+  const raw = args.agent_id ?? args.agentId ?? 'main'
+  const aid = String(raw || 'main').trim()
+  return aid || 'main'
+}
+
+function toPosixPath(p) {
+  return p.split(path.sep).join('/')
+}
+
+function formatZipTimestamp(date = new Date()) {
+  const pad = n => String(n).padStart(2, '0')
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
+}
+
+function toDosDateTime(date = new Date()) {
+  const year = Math.max(1980, Math.min(2107, date.getFullYear()))
+  const month = date.getMonth() + 1
+  const day = date.getDate()
+  const hour = date.getHours()
+  const minute = date.getMinutes()
+  const second = Math.floor(date.getSeconds() / 2)
+  const dosTime = ((hour & 0x1f) << 11) | ((minute & 0x3f) << 5) | (second & 0x1f)
+  const dosDate = (((year - 1980) & 0x7f) << 9) | ((month & 0x0f) << 5) | (day & 0x1f)
+  return { dosDate, dosTime }
+}
+
+function crc32(buffer) {
+  let crc = 0xFFFFFFFF
+  for (let i = 0; i < buffer.length; i++) {
+    crc = CRC32_TABLE[(crc ^ buffer[i]) & 0xFF] ^ (crc >>> 8)
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0
+}
+
+function buildZipBuffer(entries, now = new Date()) {
+  const localParts = []
+  const centralParts = []
+  const { dosDate, dosTime } = toDosDateTime(now)
+  let offset = 0
+
+  for (const entry of entries) {
+    const name = String(entry.name || '').replace(/^\/+/, '').replace(/\\/g, '/')
+    const nameBuf = Buffer.from(name, 'utf8')
+    const dataBuf = Buffer.isBuffer(entry.content)
+      ? entry.content
+      : Buffer.from(String(entry.content ?? ''), 'utf8')
+    const checksum = crc32(dataBuf)
+
+    const localHeader = Buffer.alloc(30)
+    localHeader.writeUInt32LE(0x04034B50, 0)
+    localHeader.writeUInt16LE(20, 4)
+    localHeader.writeUInt16LE(0, 6)
+    localHeader.writeUInt16LE(0, 8) // store
+    localHeader.writeUInt16LE(dosTime, 10)
+    localHeader.writeUInt16LE(dosDate, 12)
+    localHeader.writeUInt32LE(checksum, 14)
+    localHeader.writeUInt32LE(dataBuf.length, 18)
+    localHeader.writeUInt32LE(dataBuf.length, 22)
+    localHeader.writeUInt16LE(nameBuf.length, 26)
+    localHeader.writeUInt16LE(0, 28)
+
+    const localRecord = Buffer.concat([localHeader, nameBuf, dataBuf])
+    localParts.push(localRecord)
+
+    const centralHeader = Buffer.alloc(46)
+    centralHeader.writeUInt32LE(0x02014B50, 0)
+    centralHeader.writeUInt16LE(20, 4)
+    centralHeader.writeUInt16LE(20, 6)
+    centralHeader.writeUInt16LE(0, 8)
+    centralHeader.writeUInt16LE(0, 10)
+    centralHeader.writeUInt16LE(dosTime, 12)
+    centralHeader.writeUInt16LE(dosDate, 14)
+    centralHeader.writeUInt32LE(checksum, 16)
+    centralHeader.writeUInt32LE(dataBuf.length, 20)
+    centralHeader.writeUInt32LE(dataBuf.length, 24)
+    centralHeader.writeUInt16LE(nameBuf.length, 28)
+    centralHeader.writeUInt16LE(0, 30)
+    centralHeader.writeUInt16LE(0, 32)
+    centralHeader.writeUInt16LE(0, 34)
+    centralHeader.writeUInt16LE(0, 36)
+    centralHeader.writeUInt32LE(0, 38)
+    centralHeader.writeUInt32LE(offset, 42)
+
+    const centralRecord = Buffer.concat([centralHeader, nameBuf])
+    centralParts.push(centralRecord)
+    offset += localRecord.length
+  }
+
+  const centralSize = centralParts.reduce((n, p) => n + p.length, 0)
+  const eocd = Buffer.alloc(22)
+  eocd.writeUInt32LE(0x06054B50, 0)
+  eocd.writeUInt16LE(0, 4)
+  eocd.writeUInt16LE(0, 6)
+  eocd.writeUInt16LE(entries.length, 8)
+  eocd.writeUInt16LE(entries.length, 10)
+  eocd.writeUInt32LE(centralSize, 12)
+  eocd.writeUInt32LE(offset, 16)
+  eocd.writeUInt16LE(0, 20)
+
+  return Buffer.concat([...localParts, ...centralParts, eocd])
+}
+
+export function createMemoryService({
+  openclawDir = OPENCLAW_DIR,
+  fsModule = fs,
+  pathModule = path,
+  now = () => Date.now(),
+  cacheTtlMs = MEMORY_WORKSPACE_CACHE_TTL_MS,
+} = {}) {
+  const cache = { map: null, fetchedAt: 0 }
+
+  function readConfigWorkspaceMap() {
+    const map = new Map()
+    const fallbackMain = pathModule.join(openclawDir, 'workspace')
+    let defaultWorkspace = fallbackMain
+    const configPath = pathModule.join(openclawDir, 'openclaw.json')
+
+    if (fsModule.existsSync(configPath)) {
+      const content = fsModule.readFileSync(configPath, 'utf8')
+      const config = JSON.parse(content)
+
+      const configuredDefault = config?.agents?.defaults?.workspace
+      if (typeof configuredDefault === 'string' && configuredDefault.trim()) {
+        defaultWorkspace = configuredDefault.trim()
+      }
+
+      const list = config?.agents?.list
+      if (Array.isArray(list)) {
+        for (const item of list) {
+          const id = String(item?.id || '').trim()
+          if (!id) continue
+          const configuredWorkspace = typeof item?.workspace === 'string' ? item.workspace.trim() : ''
+          const workspace = configuredWorkspace
+            || (id === 'main'
+              ? fallbackMain
+              : pathModule.join(openclawDir, 'agents', id, 'workspace'))
+          map.set(id, workspace)
+        }
+      }
+    }
+
+    if (!map.has('main')) map.set('main', defaultWorkspace)
+    return map
+  }
+
+  function resolveWorkspaceMap() {
+    if (cache.map && now() - cache.fetchedAt < cacheTtlMs) return cache.map
+    const map = readConfigWorkspaceMap()
+    cache.map = map
+    cache.fetchedAt = now()
+    return map
+  }
+
+  function workspaceForAgent(agentId) {
+    const aid = String(agentId || 'main')
+    const map = resolveWorkspaceMap()
+    if (map.has(aid)) return map.get(aid)
+    return aid === 'main'
+      ? pathModule.join(openclawDir, 'workspace')
+      : pathModule.join(openclawDir, 'agents', aid, 'workspace')
+  }
+
+  function memoryDirForAgent(agentId, category) {
+    const ws = workspaceForAgent(agentId)
+    const cat = normalizeMemoryCategory(category)
+    if (cat === 'core') return ws
+    if (cat === 'archive') {
+      const parent = pathModule.dirname(ws)
+      if (parent && parent !== ws) return pathModule.join(parent, 'workspace-memory')
+      return pathModule.join(ws, 'memory-archive')
+    }
+    return pathModule.join(ws, 'memory')
+  }
+
+  function collectFiles(baseDir, category) {
+    if (!fsModule.existsSync(baseDir)) return []
+    const files = []
+    const allowRecurse = normalizeMemoryCategory(category) !== 'core'
+
+    const walk = (dir) => {
+      const entries = fsModule.readdirSync(dir, { withFileTypes: true })
+      for (const entry of entries) {
+        const full = pathModule.join(dir, entry.name)
+        if (entry.isDirectory()) {
+          if (allowRecurse) walk(full)
+          continue
+        }
+        const ext = pathModule.extname(entry.name).replace(/^\./, '').toLowerCase()
+        if (!MEMORY_ALLOWED_EXTS.has(ext)) continue
+        const rel = pathModule.relative(baseDir, full)
+        if (!rel || rel.startsWith('..')) continue
+        files.push(toPosixPath(rel))
+      }
+    }
+
+    walk(baseDir)
+    files.sort()
+    return files
+  }
+
+  function resolveExistingFile(agentId, filePath) {
+    const candidates = ['memory', 'archive', 'core']
+    for (const category of candidates) {
+      const base = memoryDirForAgent(agentId, category)
+      const full = pathModule.join(base, filePath)
+      if (fsModule.existsSync(full)) return full
+    }
+    return null
+  }
+
+  function listMemoryFiles({ category, agent_id, agentId } = {}) {
+    const aid = normalizeMemoryAgentId({ agent_id, agentId })
+    const cat = normalizeMemoryCategory(category)
+    const dir = memoryDirForAgent(aid, cat)
+    return collectFiles(dir, cat)
+  }
+
+  function readMemoryFile({ path: filePath, agent_id, agentId } = {}) {
+    if (isUnsafePath(filePath)) throw new Error('非法路径')
+    const aid = normalizeMemoryAgentId({ agent_id, agentId })
+    const full = resolveExistingFile(aid, filePath)
+    if (!full) throw new Error(`文件不存在: ${filePath}`)
+    return fsModule.readFileSync(full, 'utf8')
+  }
+
+  function writeMemoryFile({ path: filePath, content, category, agent_id, agentId } = {}) {
+    if (isUnsafePath(filePath)) throw new Error('非法路径')
+    const aid = normalizeMemoryAgentId({ agent_id, agentId })
+    const cat = normalizeMemoryCategory(category)
+    const base = memoryDirForAgent(aid, cat)
+    const full = pathModule.join(base, filePath)
+    const dir = pathModule.dirname(full)
+    if (!fsModule.existsSync(dir)) fsModule.mkdirSync(dir, { recursive: true })
+    fsModule.writeFileSync(full, String(content ?? ''))
+    return true
+  }
+
+  function deleteMemoryFile({ path: filePath, agent_id, agentId } = {}) {
+    if (isUnsafePath(filePath)) throw new Error('非法路径')
+    const aid = normalizeMemoryAgentId({ agent_id, agentId })
+    const full = resolveExistingFile(aid, filePath)
+    if (!full) throw new Error(`文件不存在: ${filePath}`)
+    fsModule.unlinkSync(full)
+    return true
+  }
+
+  function exportMemoryZip({ category, agent_id, agentId } = {}) {
+    const aid = normalizeMemoryAgentId({ agent_id, agentId })
+    const cat = normalizeMemoryCategory(category)
+    const dir = memoryDirForAgent(aid, cat)
+    if (!fsModule.existsSync(dir)) throw new Error('目录不存在')
+
+    const files = collectFiles(dir, cat)
+    if (!files.length) throw new Error('没有可导出的文件')
+
+    const entries = files.map(relPath => {
+      const full = pathModule.join(dir, relPath)
+      return { name: relPath, content: fsModule.readFileSync(full, 'utf8') }
+    })
+    const zipBuffer = buildZipBuffer(entries, new Date(now()))
+    return {
+      filename: `openclaw-${cat}-${formatZipTimestamp(new Date(now()))}.zip`,
+      mimeType: 'application/zip',
+      dataBase64: zipBuffer.toString('base64'),
+    }
+  }
+
+  return {
+    listMemoryFiles,
+    readMemoryFile,
+    writeMemoryFile,
+    deleteMemoryFile,
+    exportMemoryZip,
+  }
+}
+
 function getUid() {
   if (!isMac) return 0
   return execSync('id -u').toString().trim()
@@ -1749,6 +2043,8 @@ function serverCached(key, ttlMs, fn) {
 }
 
 // === API Handlers ===
+
+const memoryService = createMemoryService()
 
 const handlers = {
   // 配置读写
@@ -3410,41 +3706,24 @@ const handlers = {
   },
 
   // 记忆文件
-  list_memory_files({ category, agent_id }) {
-    const suffix = agent_id && agent_id !== 'main' ? `/agents/${agent_id}` : ''
-    const dir = path.join(OPENCLAW_DIR, 'workspace' + suffix, category || 'memory')
-    if (!fs.existsSync(dir)) return []
-    return fs.readdirSync(dir).filter(f => f.endsWith('.md'))
+  list_memory_files(args) {
+    return memoryService.listMemoryFiles(args)
   },
 
-  read_memory_file({ path: filePath, agent_id }) {
-    if (isUnsafePath(filePath)) throw new Error('非法路径')
-    const suffix = agent_id && agent_id !== 'main' ? `/agents/${agent_id}` : ''
-    const full = path.join(OPENCLAW_DIR, 'workspace' + suffix, filePath)
-    if (!fs.existsSync(full)) return ''
-    return fs.readFileSync(full, 'utf8')
+  read_memory_file(args) {
+    return memoryService.readMemoryFile(args)
   },
 
-  write_memory_file({ path: filePath, content, category, agent_id }) {
-    if (isUnsafePath(filePath)) throw new Error('非法路径')
-    const suffix = agent_id && agent_id !== 'main' ? `/agents/${agent_id}` : ''
-    const full = path.join(OPENCLAW_DIR, 'workspace' + suffix, filePath)
-    const dir = path.dirname(full)
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
-    fs.writeFileSync(full, content)
-    return true
+  write_memory_file(args) {
+    return memoryService.writeMemoryFile(args)
   },
 
-  delete_memory_file({ path: filePath, agent_id }) {
-    if (isUnsafePath(filePath)) throw new Error('非法路径')
-    const suffix = agent_id && agent_id !== 'main' ? `/agents/${agent_id}` : ''
-    const full = path.join(OPENCLAW_DIR, 'workspace' + suffix, filePath)
-    if (fs.existsSync(full)) fs.unlinkSync(full)
-    return true
+  delete_memory_file(args) {
+    return memoryService.deleteMemoryFile(args)
   },
 
-  export_memory_zip({ category, agent_id }) {
-    throw new Error('ZIP 导出仅在 Tauri 桌面应用中可用')
+  export_memory_zip(args) {
+    return memoryService.exportMemoryZip(args)
   },
 
   // 备份管理
