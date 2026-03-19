@@ -278,16 +278,15 @@ pm2 save
 
 ```bash
 # 本地构建并打包
-npm run build
-zip -r clawpanel-web.zip dist package.json scripts/serve.js scripts/dev-api.js
+npm run package:web
 
 # 上传到目标机
-scp clawpanel-web.zip user@server:/opt/clawpanel/
+scp clawpanel.zip user@server:/opt/clawpanel/
 
 # 目标机解压并启动
 ssh user@server
 cd /opt/clawpanel
-unzip -o clawpanel-web.zip
+unzip -o clawpanel.zip
 pm2 start scripts/serve.js --interpreter node --name clawpanel -- --port 1420
 pm2 save
 ```

@@ -468,6 +468,14 @@ Web 版功能与桌面版一致，后端通过 `scripts/dev-api.js` 调用本机
 
 其中 `serve.js` 在运行时会直接导入 `scripts/dev-api.js`，缺少该文件时服务无法启动。
 
+可以直接执行：
+
+```bash
+npm run package:web
+```
+
+该命令会先构建前端，再在仓库根目录生成 `clawpanel.zip`。
+
 > **ARM/Armbian 用户**：Web 模式天然兼容 ARM64 设备，详见 [Armbian 部署指南](docs/armbian-deploy.md)。
 
 ## 快速上手
