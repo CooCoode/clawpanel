@@ -459,6 +459,15 @@ npm run serve
 
 Web 版功能与桌面版一致，后端通过 `scripts/dev-api.js` 调用本机 OpenClaw CLI 实现。
 
+如果你打算把 Web 版做成最小运行包（例如 `zip + scp + pm2`），压缩包至少需要包含：
+
+- `dist/`
+- `package.json`
+- `scripts/serve.js`
+- `scripts/dev-api.js`
+
+其中 `serve.js` 在运行时会直接导入 `scripts/dev-api.js`，缺少该文件时服务无法启动。
+
 > **ARM/Armbian 用户**：Web 模式天然兼容 ARM64 设备，详见 [Armbian 部署指南](docs/armbian-deploy.md)。
 
 ## 快速上手

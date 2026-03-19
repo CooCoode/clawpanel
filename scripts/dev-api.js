@@ -29,6 +29,8 @@ const isLinux = process.platform === 'linux'
 const SCOPES = ['operator.admin', 'operator.approvals', 'operator.pairing', 'operator.read', 'operator.write']
 const CLUSTER_TOKEN = 'clawpanel-cluster-secret-2026'
 const PANEL_CONFIG_PATH = path.join(OPENCLAW_DIR, 'clawpanel.json')
+const OAUTH_STATE_PATH = path.join(OPENCLAW_DIR, 'clawpanel-oauth.json')
+const OAUTH_BOOTSTRAP_PATH = path.join(OPENCLAW_DIR, 'clawpanel-oauth-bootstrap.json')
 const DOCKER_NODES_PATH = path.join(OPENCLAW_DIR, 'docker-nodes.json')
 const INSTANCES_PATH = path.join(OPENCLAW_DIR, 'instances.json')
 const DOCKER_SOCKET = process.platform === 'win32' ? '//./pipe/docker_engine' : '/var/run/docker.sock'
@@ -57,6 +59,9 @@ const CHANNEL_PLUGIN_ID_MAP = {
 const QQBOT_PLUGIN_PACKAGE_CANDIDATES = [
   '@tencent-connect/openclaw-qqbot@latest',
 ]
+const OAUTH_SCOPE = 'panel:admin'
+const OAUTH_ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000
+const OAUTH_REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000
 
 export function getQqbotPluginPackageCandidates() {
   return [...QQBOT_PLUGIN_PACKAGE_CANDIDATES]
@@ -668,6 +673,433 @@ function isAuthenticated(req) {
   return true
 }
 
+function sha256(value) {
+  return crypto.createHash('sha256').update(String(value || ''), 'utf8').digest('hex')
+}
+
+function jsonClone(value) {
+  return JSON.parse(JSON.stringify(value))
+}
+
+function ensureDir(dirPath) {
+  if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true })
+}
+
+function readJsonFileSafe(filePath, fallback) {
+  try {
+    if (fs.existsSync(filePath)) return JSON.parse(fs.readFileSync(filePath, 'utf8'))
+  } catch {}
+  return jsonClone(fallback)
+}
+
+function timingSafeHexEqual(left, right) {
+  const a = Buffer.from(String(left || ''), 'hex')
+  const b = Buffer.from(String(right || ''), 'hex')
+  if (a.length !== b.length) return false
+  return crypto.timingSafeEqual(a, b)
+}
+
+class OAuthError extends Error {
+  constructor(code, status = 400, message = '') {
+    super(message || code)
+    this.name = 'OAuthError'
+    this.code = code
+    this.status = status
+  }
+}
+
+function createOauthError(code, status = 400, message = '') {
+  return new OAuthError(code, status, message)
+}
+
+function normalizeOAuthState(raw = {}) {
+  return {
+    version: 1,
+    clients: Array.isArray(raw.clients) ? raw.clients : [],
+    accessTokens: Array.isArray(raw.accessTokens) ? raw.accessTokens : [],
+    refreshTokens: Array.isArray(raw.refreshTokens) ? raw.refreshTokens : [],
+    importedBootstrapClientIds: Array.isArray(raw.importedBootstrapClientIds) ? raw.importedBootstrapClientIds : [],
+  }
+}
+
+function defaultRandomId() {
+  return crypto.randomBytes(6).toString('hex')
+}
+
+function defaultRandomToken(prefix = 'cp') {
+  return `${prefix}_${crypto.randomBytes(24).toString('base64url')}`
+}
+
+function normalizeRequestedScope(scope) {
+  const normalized = String(scope || '').trim()
+  if (!normalized) return OAUTH_SCOPE
+  if (normalized === OAUTH_SCOPE) return normalized
+  throw createOauthError('invalid_scope', 400, '仅支持 panel:admin scope')
+}
+
+function oauthErrorBody(err) {
+  return {
+    error: err?.code || 'server_error',
+    error_description: err?.message || '请求失败',
+  }
+}
+
+export const API_SESSION_ONLY_CMDS = new Set([
+  'auth_set_password',
+  'auth_change_password',
+  'auth_status',
+  'auth_ignore_risk',
+  'read_panel_config',
+  'write_panel_config',
+  'write_env_file',
+  'get_oauth_status',
+  'list_oauth_clients',
+  'create_oauth_client',
+  'rotate_oauth_client_secret',
+  'set_oauth_client_enabled',
+  'delete_oauth_client',
+])
+
+export function createOAuthService({
+  openclawDir = OPENCLAW_DIR,
+  panelConfigPath = path.join(openclawDir, 'clawpanel.json'),
+  statePath = path.join(openclawDir, 'clawpanel-oauth.json'),
+  bootstrapPath = path.join(openclawDir, 'clawpanel-oauth-bootstrap.json'),
+  now = () => Date.now(),
+  randomId = defaultRandomId,
+  randomToken = defaultRandomToken,
+} = {}) {
+  function readPanelConfigSafe() {
+    return readJsonFileSafe(panelConfigPath, {})
+  }
+
+  function isEnabled() {
+    const cfg = readPanelConfigSafe()
+    return !!cfg.accessPassword && !cfg.ignoreRisk
+  }
+
+  function getDisabledReason() {
+    const cfg = readPanelConfigSafe()
+    if (cfg.ignoreRisk) return '面板当前处于无视风险模式'
+    if (!cfg.accessPassword) return '请先为面板设置访问密码'
+    return ''
+  }
+
+  function ensureEnabled() {
+    if (!isEnabled()) throw createOauthError('access_denied', 403, getDisabledReason() || 'OAuth 已禁用')
+  }
+
+  function readState() {
+    return normalizeOAuthState(readJsonFileSafe(statePath, normalizeOAuthState()))
+  }
+
+  function saveState(state) {
+    ensureDir(openclawDir)
+    fs.writeFileSync(statePath, JSON.stringify(normalizeOAuthState(state), null, 2))
+  }
+
+  function pruneExpiredTokens(state) {
+    const ts = now()
+    let changed = false
+    state.accessTokens.forEach((token) => {
+      if (!token.revokedAt && token.expiresAt <= ts) {
+        token.revokedAt = ts
+        changed = true
+      }
+    })
+    state.refreshTokens.forEach((token) => {
+      if (!token.revokedAt && token.expiresAt <= ts) {
+        token.revokedAt = ts
+        changed = true
+      }
+    })
+    return changed
+  }
+
+  function withState(mutator) {
+    const state = readState()
+    const changedByPrune = pruneExpiredTokens(state)
+    const result = mutator(state)
+    if (changedByPrune || result?.save !== false) saveState(state)
+    return result?.value
+  }
+
+  function findClient(state, clientId) {
+    return state.clients.find((client) => client.clientId === String(clientId || '').trim())
+  }
+
+  function ensureClientCredentials(state, clientId, clientSecret) {
+    const client = findClient(state, clientId)
+    if (!client || !client.enabled) {
+      throw createOauthError('invalid_client', 401, 'client 无效或已禁用')
+    }
+    if (!clientSecret || !timingSafeHexEqual(client.secretHash, sha256(clientSecret))) {
+      throw createOauthError('invalid_client', 401, 'client 认证失败')
+    }
+    return client
+  }
+
+  function revokeClientTokens(state, clientId) {
+    const ts = now()
+    state.accessTokens.forEach((token) => {
+      if (token.clientId === clientId && !token.revokedAt) token.revokedAt = ts
+    })
+    state.refreshTokens.forEach((token) => {
+      if (token.clientId === clientId && !token.revokedAt) token.revokedAt = ts
+    })
+  }
+
+  function makeClientPublic(client, state) {
+    const activeAccessTokens = state.accessTokens.filter((token) => token.clientId === client.clientId && !token.revokedAt).length
+    const activeRefreshTokens = state.refreshTokens.filter((token) => token.clientId === client.clientId && !token.revokedAt).length
+    return {
+      clientId: client.clientId,
+      name: client.name,
+      enabled: client.enabled !== false,
+      createdAt: client.createdAt || null,
+      rotatedAt: client.rotatedAt || null,
+      lastUsedAt: client.lastUsedAt || null,
+      source: state.importedBootstrapClientIds.includes(client.clientId) ? 'bootstrap' : 'manual',
+      activeAccessTokens,
+      activeRefreshTokens,
+    }
+  }
+
+  function issueTokenPair(state, client, scope) {
+    const ts = now()
+    const accessToken = randomToken('cpat')
+    const refreshToken = randomToken('cprt')
+    state.accessTokens.push({
+      tokenHash: sha256(accessToken),
+      clientId: client.clientId,
+      scope,
+      issuedAt: ts,
+      expiresAt: ts + OAUTH_ACCESS_TOKEN_TTL_MS,
+      revokedAt: null,
+      lastUsedAt: null,
+    })
+    state.refreshTokens.push({
+      tokenHash: sha256(refreshToken),
+      clientId: client.clientId,
+      scope,
+      issuedAt: ts,
+      expiresAt: ts + OAUTH_REFRESH_TOKEN_TTL_MS,
+      revokedAt: null,
+      rotatedAt: null,
+    })
+    client.lastUsedAt = ts
+    return {
+      accessToken,
+      refreshToken,
+      tokenType: 'Bearer',
+      expiresIn: Math.floor(OAUTH_ACCESS_TOKEN_TTL_MS / 1000),
+      scope,
+    }
+  }
+
+  return {
+    isEnabled,
+    getStatus() {
+      const state = readState()
+      pruneExpiredTokens(state)
+      return {
+        enabled: isEnabled(),
+        reason: getDisabledReason(),
+        scope: OAUTH_SCOPE,
+        accessTokenTtlSeconds: Math.floor(OAUTH_ACCESS_TOKEN_TTL_MS / 1000),
+        refreshTokenTtlSeconds: Math.floor(OAUTH_REFRESH_TOKEN_TTL_MS / 1000),
+        tokenEndpoint: '/oauth/token',
+        revokeEndpoint: '/oauth/revoke',
+        bootstrapPath,
+        statePath,
+        clientCount: state.clients.length,
+        hasBootstrapFile: fs.existsSync(bootstrapPath),
+      }
+    },
+    listClients() {
+      const state = readState()
+      pruneExpiredTokens(state)
+      return state.clients.map((client) => makeClientPublic(client, state)).sort((a, b) => String(a.clientId).localeCompare(String(b.clientId)))
+    },
+    createClient({ clientId, clientSecret, name, enabled = true } = {}) {
+      ensureEnabled()
+      const resolvedClientId = String(clientId || `cpc_${randomId()}`).trim()
+      const resolvedSecret = String(clientSecret || randomToken('cpcs')).trim()
+      const resolvedName = String(name || 'OAuth Client').trim()
+      if (!resolvedClientId) throw new Error('clientId 不能为空')
+      if (!resolvedSecret) throw new Error('clientSecret 不能为空')
+      if (!resolvedName) throw new Error('name 不能为空')
+      return withState((state) => {
+        if (findClient(state, resolvedClientId)) throw new Error(`OAuth client "${resolvedClientId}" 已存在`)
+        const ts = now()
+        const client = {
+          clientId: resolvedClientId,
+          name: resolvedName,
+          secretHash: sha256(resolvedSecret),
+          enabled: enabled !== false,
+          createdAt: ts,
+          rotatedAt: null,
+          lastUsedAt: null,
+        }
+        state.clients.push(client)
+        return { value: { ...makeClientPublic(client, state), clientSecret: resolvedSecret } }
+      })
+    },
+    rotateClientSecret({ clientId } = {}) {
+      ensureEnabled()
+      const resolvedClientId = String(clientId || '').trim()
+      if (!resolvedClientId) throw new Error('clientId 不能为空')
+      return withState((state) => {
+        const client = findClient(state, resolvedClientId)
+        if (!client) throw new Error(`OAuth client "${resolvedClientId}" 不存在`)
+        const ts = now()
+        const nextSecret = randomToken('cpcs')
+        client.secretHash = sha256(nextSecret)
+        client.rotatedAt = ts
+        client.lastUsedAt = null
+        revokeClientTokens(state, client.clientId)
+        return { value: { clientId: client.clientId, clientSecret: nextSecret, rotatedAt: ts } }
+      })
+    },
+    setClientEnabled({ clientId, enabled } = {}) {
+      ensureEnabled()
+      const resolvedClientId = String(clientId || '').trim()
+      if (!resolvedClientId) throw new Error('clientId 不能为空')
+      return withState((state) => {
+        const client = findClient(state, resolvedClientId)
+        if (!client) throw new Error(`OAuth client "${resolvedClientId}" 不存在`)
+        client.enabled = enabled !== false
+        if (!client.enabled) revokeClientTokens(state, client.clientId)
+        return { value: makeClientPublic(client, state) }
+      })
+    },
+    deleteClient({ clientId } = {}) {
+      ensureEnabled()
+      const resolvedClientId = String(clientId || '').trim()
+      if (!resolvedClientId) throw new Error('clientId 不能为空')
+      return withState((state) => {
+        const idx = state.clients.findIndex((client) => client.clientId === resolvedClientId)
+        if (idx < 0) throw new Error(`OAuth client "${resolvedClientId}" 不存在`)
+        revokeClientTokens(state, resolvedClientId)
+        state.clients.splice(idx, 1)
+        return { value: { success: true } }
+      })
+    },
+    exchangeToken({ grantType, clientId, clientSecret, scope, refreshToken } = {}) {
+      const resolvedGrantType = String(grantType || '').trim()
+      if (resolvedGrantType === 'client_credentials') {
+        return this.issueClientCredentials({ clientId, clientSecret, scope })
+      }
+      if (resolvedGrantType === 'refresh_token') {
+        return this.refreshAccessToken({ clientId, clientSecret, refreshToken })
+      }
+      throw createOauthError('unsupported_grant_type', 400, '仅支持 client_credentials 和 refresh_token')
+    },
+    issueClientCredentials({ clientId, clientSecret, scope } = {}) {
+      ensureEnabled()
+      const normalizedScope = normalizeRequestedScope(scope)
+      return withState((state) => {
+        const client = ensureClientCredentials(state, clientId, clientSecret)
+        return { value: issueTokenPair(state, client, normalizedScope) }
+      })
+    },
+    refreshAccessToken({ clientId, clientSecret, refreshToken } = {}) {
+      ensureEnabled()
+      const refreshValue = String(refreshToken || '').trim()
+      if (!refreshValue) throw createOauthError('invalid_request', 400, 'refresh_token 不能为空')
+      return withState((state) => {
+        const client = ensureClientCredentials(state, clientId, clientSecret)
+        const tokenHash = sha256(refreshValue)
+        const current = state.refreshTokens.find((token) => token.tokenHash === tokenHash && !token.revokedAt)
+        if (!current || current.clientId !== client.clientId || current.expiresAt <= now()) {
+          throw createOauthError('invalid_grant', 400, 'refresh_token 无效或已过期')
+        }
+        current.revokedAt = now()
+        current.rotatedAt = now()
+        return { value: issueTokenPair(state, client, OAUTH_SCOPE) }
+      })
+    },
+    revokeToken({ clientId, clientSecret, token } = {}) {
+      ensureEnabled()
+      const tokenValue = String(token || '').trim()
+      if (!tokenValue) return { success: true }
+      return withState((state) => {
+        const client = ensureClientCredentials(state, clientId, clientSecret)
+        const tokenHash = sha256(tokenValue)
+        const accessToken = state.accessTokens.find((item) => item.tokenHash === tokenHash && item.clientId === client.clientId)
+        const refreshToken = state.refreshTokens.find((item) => item.tokenHash === tokenHash && item.clientId === client.clientId)
+        const ts = now()
+        if (accessToken && !accessToken.revokedAt) accessToken.revokedAt = ts
+        if (refreshToken && !refreshToken.revokedAt) refreshToken.revokedAt = ts
+        return { value: { success: true } }
+      })
+    },
+    authenticateBearer(token) {
+      const tokenValue = String(token || '').trim()
+      if (!tokenValue || !isEnabled()) return null
+      return withState((state) => {
+        const tokenHash = sha256(tokenValue)
+        const current = state.accessTokens.find((item) => item.tokenHash === tokenHash && !item.revokedAt)
+        if (!current || current.expiresAt <= now()) {
+          if (current && !current.revokedAt) current.revokedAt = now()
+          return { value: null }
+        }
+        const client = findClient(state, current.clientId)
+        if (!client || !client.enabled) {
+          current.revokedAt = now()
+          return { value: null }
+        }
+        current.lastUsedAt = now()
+        client.lastUsedAt = now()
+        return { value: { clientId: client.clientId, scope: current.scope, method: 'bearer' } }
+      })
+    },
+    importBootstrapClients() {
+      if (!fs.existsSync(bootstrapPath) || !isEnabled()) return { importedClientIds: [] }
+      const bootstrap = readJsonFileSafe(bootstrapPath, { clients: [] })
+      const importedClientIds = []
+      withState((state) => {
+        for (const rawClient of Array.isArray(bootstrap.clients) ? bootstrap.clients : []) {
+          const bootstrapClientId = String(rawClient?.clientId || '').trim()
+          const bootstrapSecret = String(rawClient?.clientSecret || '').trim()
+          if (!bootstrapClientId || !bootstrapSecret) continue
+          if (state.importedBootstrapClientIds.includes(bootstrapClientId)) continue
+          if (!findClient(state, bootstrapClientId)) {
+            state.clients.push({
+              clientId: bootstrapClientId,
+              name: String(rawClient?.name || bootstrapClientId).trim() || bootstrapClientId,
+              secretHash: sha256(bootstrapSecret),
+              enabled: rawClient?.enabled !== false,
+              createdAt: now(),
+              rotatedAt: null,
+              lastUsedAt: null,
+            })
+          }
+          state.importedBootstrapClientIds.push(bootstrapClientId)
+          importedClientIds.push(bootstrapClientId)
+        }
+        return { value: null }
+      })
+      try { fs.rmSync(bootstrapPath, { force: true }) } catch {}
+      return { importedClientIds }
+    },
+  }
+}
+
+export function createApiAccessController({ oauthService = null } = {}) {
+  return {
+    authorize({ cmd, sessionAuthenticated, bearerToken }) {
+      if (sessionAuthenticated) return { ok: true, method: 'session' }
+      if (API_SESSION_ONLY_CMDS.has(cmd)) return { ok: false, code: 'AUTH_REQUIRED' }
+      const tokenValue = String(bearerToken || '').trim()
+      if (!tokenValue) return { ok: false, code: 'AUTH_REQUIRED' }
+      const bearer = oauthService?.authenticateBearer(tokenValue)
+      if (!bearer) return { ok: false, code: 'AUTH_REQUIRED' }
+      return { ok: true, method: 'bearer', clientId: bearer.clientId, scope: bearer.scope }
+    },
+  }
+}
+
 function checkPasswordStrength(pw) {
   if (!pw || pw.length < 6) return '密码至少 6 位'
   if (pw.length > 64) return '密码不能超过 64 位'
@@ -697,6 +1129,54 @@ function readBody(req) {
       catch { resolve({}) }
     })
   })
+}
+
+function readTextBody(req) {
+  return new Promise((resolve) => {
+    let body = ''
+    let size = 0
+    req.on('data', chunk => {
+      size += chunk.length
+      if (size > MAX_BODY_SIZE) {
+        req.destroy()
+        resolve('')
+        return
+      }
+      body += chunk
+    })
+    req.on('end', () => resolve(body))
+  })
+}
+
+function parseFormBody(text) {
+  const params = new URLSearchParams(String(text || ''))
+  const result = {}
+  for (const [key, value] of params.entries()) {
+    if (!(key in result)) result[key] = value
+  }
+  return result
+}
+
+function parseBasicAuth(req) {
+  const header = String(req.headers.authorization || '')
+  if (!header.startsWith('Basic ')) return null
+  try {
+    const decoded = Buffer.from(header.slice(6), 'base64').toString('utf8')
+    const idx = decoded.indexOf(':')
+    if (idx < 0) return null
+    return {
+      clientId: decoded.slice(0, idx),
+      clientSecret: decoded.slice(idx + 1),
+    }
+  } catch {
+    return null
+  }
+}
+
+function parseBearerAuth(req) {
+  const header = String(req.headers.authorization || '')
+  if (!header.startsWith('Bearer ')) return ''
+  return header.slice(7).trim()
 }
 
 const MEMORY_ALLOWED_EXTS = new Set(['md', 'txt', 'json', 'jsonl'])
@@ -1914,11 +2394,11 @@ function getActiveInstance() {
   return data.instances.find(i => i.id === data.activeId) || data.instances[0]
 }
 
-async function proxyToInstance(instance, cmd, body) {
+async function proxyToInstance(instance, cmd, body, headers = null) {
   const url = `${instance.endpoint}/__api/${cmd}`
   const resp = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...(headers || {}) },
     body: JSON.stringify(body),
   })
   const text = await resp.text()
@@ -1998,6 +2478,8 @@ const ALWAYS_LOCAL = new Set([
   'docker_cluster_overview',
   'auth_check', 'auth_login', 'auth_logout',
   'read_panel_config', 'write_panel_config',
+  'get_oauth_status', 'list_oauth_clients', 'create_oauth_client',
+  'rotate_oauth_client_secret', 'set_oauth_client_enabled', 'delete_oauth_client',
   'get_deploy_mode',
   'assistant_exec', 'assistant_read_file', 'assistant_write_file',
   'assistant_list_dir', 'assistant_system_info', 'assistant_list_processes',
@@ -2045,6 +2527,8 @@ function serverCached(key, ttlMs, fn) {
 // === API Handlers ===
 
 const memoryService = createMemoryService()
+const oauthService = createOAuthService()
+const apiAccessController = createApiAccessController({ oauthService })
 
 const handlers = {
   // 配置读写
@@ -4567,6 +5051,29 @@ const handlers = {
     _sessions.clear()
     return true
   },
+  get_oauth_status() {
+    const status = oauthService.getStatus()
+    return {
+      ...status,
+      clients: oauthService.listClients(),
+    }
+  },
+  list_oauth_clients() {
+    if (!oauthService.isEnabled()) throw createOauthError('access_denied', 403, oauthService.getStatus().reason || 'OAuth 已禁用')
+    return { clients: oauthService.listClients() }
+  },
+  create_oauth_client({ clientId, clientSecret, name, enabled } = {}) {
+    return oauthService.createClient({ clientId, clientSecret, name, enabled })
+  },
+  rotate_oauth_client_secret({ clientId } = {}) {
+    return oauthService.rotateClientSecret({ clientId })
+  },
+  set_oauth_client_enabled({ clientId, enabled } = {}) {
+    return oauthService.setClientEnabled({ clientId, enabled })
+  },
+  delete_oauth_client({ clientId } = {}) {
+    return oauthService.deleteClient({ clientId })
+  },
 
   check_panel_update() { return { latest: null, url: 'https://github.com/qingchencloud/clawpanel/releases' } },
 
@@ -4611,6 +5118,84 @@ const handlers = {
 
 // === Vite 插件 ===
 
+function sendJson(res, statusCode, data, extraHeaders = null) {
+  res.statusCode = statusCode
+  if (extraHeaders) {
+    for (const [key, value] of Object.entries(extraHeaders)) {
+      res.setHeader(key, value)
+    }
+  }
+  res.setHeader('Content-Type', 'application/json')
+  res.end(JSON.stringify(data))
+}
+
+function sendOAuthErrorResponse(res, err) {
+  const oauthErr = err instanceof OAuthError ? err : createOauthError('server_error', 500, err?.message || '服务端错误')
+  const headers = oauthErr.code === 'invalid_client'
+    ? { 'WWW-Authenticate': 'Basic realm="ClawPanel OAuth"' }
+    : null
+  sendJson(res, oauthErr.status || 400, oauthErrorBody(oauthErr), headers)
+}
+
+async function readOAuthFormRequest(req) {
+  const contentType = String(req.headers['content-type'] || '').toLowerCase()
+  if (!contentType.includes('application/x-www-form-urlencoded')) {
+    throw createOauthError('invalid_request', 400, 'Content-Type 必须为 application/x-www-form-urlencoded')
+  }
+  const raw = await readTextBody(req)
+  if (!raw) return {}
+  return parseFormBody(raw)
+}
+
+async function handleOAuthRequest(req, res) {
+  const route = req.url.split('?')[0]
+  if (req.method === 'OPTIONS') {
+    res.statusCode = 204
+    res.end()
+    return true
+  }
+  if (route === '/oauth/token') {
+    try {
+      const form = await readOAuthFormRequest(req)
+      const basicAuth = parseBasicAuth(req)
+      const clientId = String(basicAuth?.clientId || form.client_id || '').trim()
+      const clientSecret = String(basicAuth?.clientSecret || form.client_secret || '').trim()
+      const result = oauthService.exchangeToken({
+        grantType: form.grant_type || '',
+        clientId,
+        clientSecret,
+        scope: form.scope || '',
+        refreshToken: form.refresh_token || '',
+      })
+      sendJson(res, 200, {
+        access_token: result.accessToken,
+        refresh_token: result.refreshToken,
+        token_type: result.tokenType,
+        expires_in: result.expiresIn,
+        scope: result.scope,
+      })
+    } catch (err) {
+      sendOAuthErrorResponse(res, err)
+    }
+    return true
+  }
+  if (route === '/oauth/revoke') {
+    try {
+      const form = await readOAuthFormRequest(req)
+      const basicAuth = parseBasicAuth(req)
+      const clientId = String(basicAuth?.clientId || form.client_id || '').trim()
+      const clientSecret = String(basicAuth?.clientSecret || form.client_secret || '').trim()
+      const token = String(form.token || '').trim()
+      const result = oauthService.revokeToken({ clientId, clientSecret, token })
+      sendJson(res, 200, result)
+    } catch (err) {
+      sendOAuthErrorResponse(res, err)
+    }
+    return true
+  }
+  return false
+}
+
 // 初始化：密码检测 + 启动日志 + 定时清理
 function _initApi() {
   const cfg = readPanelConfig()
@@ -4627,6 +5212,14 @@ function _initApi() {
   console.log('[api] API 已启动，配置目录:', OPENCLAW_DIR)
   console.log('[api] 平台:', isMac ? 'macOS' : process.platform)
   console.log('[api] 访问密码:', pw ? '已设置' : (cfg.ignoreRisk ? '无视风险模式（无密码）' : '未设置'))
+  try {
+    const imported = oauthService.importBootstrapClients()
+    if (imported.importedClientIds.length) {
+      console.log('[api] OAuth bootstrap 已导入:', imported.importedClientIds.join(', '))
+    }
+  } catch (err) {
+    console.warn('[api] OAuth bootstrap 导入失败:', err.message || err)
+  }
 
   // 定时清理过期 session 和登录限速记录（每 10 分钟）
   setInterval(() => {
@@ -4642,6 +5235,10 @@ function _initApi() {
 
 // API 中间件（dev server 和 preview server 共用）
 async function _apiMiddleware(req, res, next) {
+  if (req.url?.startsWith('/oauth/')) {
+    const handled = await handleOAuthRequest(req, res)
+    if (handled) return
+  }
   if (!req.url?.startsWith('/__api/')) return next()
 
   const cmd = req.url.slice(7).split('?')[0]
@@ -4801,7 +5398,12 @@ async function _apiMiddleware(req, res, next) {
   }
 
   // --- 认证中间件：非豁免接口必须校验 ---
-  if (!isAuthenticated(req)) {
+  const authResult = apiAccessController.authorize({
+    cmd,
+    sessionAuthenticated: isAuthenticated(req),
+    bearerToken: parseBearerAuth(req),
+  })
+  if (!authResult.ok) {
     res.statusCode = 401
     res.setHeader('Content-Type', 'application/json')
     res.end(JSON.stringify({ error: '未登录', code: 'AUTH_REQUIRED' }))
@@ -4813,7 +5415,10 @@ async function _apiMiddleware(req, res, next) {
   if (activeInst.type !== 'local' && activeInst.endpoint && !ALWAYS_LOCAL.has(cmd)) {
     try {
       const args = await readBody(req)
-      const result = await proxyToInstance(activeInst, cmd, args)
+      const forwardHeaders = {}
+      if (req.headers.authorization) forwardHeaders.Authorization = req.headers.authorization
+      if (req.headers.cookie) forwardHeaders.Cookie = req.headers.cookie
+      const result = await proxyToInstance(activeInst, cmd, args, forwardHeaders)
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify(result))
     } catch (e) {
@@ -4839,9 +5444,9 @@ async function _apiMiddleware(req, res, next) {
     res.setHeader('Content-Type', 'application/json')
     res.end(JSON.stringify(result))
   } catch (e) {
-    res.statusCode = 500
+    res.statusCode = e instanceof OAuthError ? (e.status || 400) : 500
     res.setHeader('Content-Type', 'application/json')
-    res.end(JSON.stringify({ error: e.message || String(e) }))
+    res.end(JSON.stringify({ error: e.message || String(e), ...(e instanceof OAuthError ? { code: e.code } : {}) }))
   }
 }
 

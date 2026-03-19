@@ -256,6 +256,121 @@ pm2 save
 pm2 startup    # 开机自启
 ```
 
+如果你是用 `zip + scp + pm2` 做最小运行包部署，推荐直接启动 `serve.js`：
+
+```bash
+pm2 start scripts/serve.js --interpreter node --name clawpanel -- --port 1420
+pm2 save
+```
+
+### 方式三：最小运行包（zip + scp + pm2）
+
+如果目标机不需要源码仓库，只想运行已经构建好的 Web 版，可以打一个最小压缩包。**至少需要包含：**
+
+- `dist/`
+- `package.json`
+- `scripts/serve.js`
+- `scripts/dev-api.js`
+
+> `scripts/serve.js` 会在运行时直接导入 `scripts/dev-api.js`，因此不能只带 `serve.js` 而漏掉 `dev-api.js`。
+
+部署示例：
+
+```bash
+# 本地构建并打包
+npm run build
+zip -r clawpanel-web.zip dist package.json scripts/serve.js scripts/dev-api.js
+
+# 上传到目标机
+scp clawpanel-web.zip user@server:/opt/clawpanel/
+
+# 目标机解压并启动
+ssh user@server
+cd /opt/clawpanel
+unzip -o clawpanel-web.zip
+pm2 start scripts/serve.js --interpreter node --name clawpanel -- --port 1420
+pm2 save
+```
+
+### 自动化部署预置 OAuth Client
+
+Web 版现已支持内置 OAuth。对于自动化部署，推荐在 `pm2` 启动前，由部署系统额外写入 bootstrap 文件：
+
+路径：
+
+```bash
+~/.openclaw/clawpanel-oauth-bootstrap.json
+```
+
+最小示例：
+
+```json
+{
+  "clients": [
+    {
+      "clientId": "deploy-controller",
+      "clientSecret": "replace-with-generated-secret",
+      "name": "Deploy Controller",
+      "enabled": true
+    }
+  ]
+}
+```
+
+建议流程：
+
+```bash
+mkdir -p ~/.openclaw
+cat > ~/.openclaw/clawpanel-oauth-bootstrap.json <<'EOF'
+{
+  "clients": [
+    {
+      "clientId": "deploy-controller",
+      "clientSecret": "replace-with-generated-secret",
+      "name": "Deploy Controller",
+      "enabled": true
+    }
+  ]
+}
+EOF
+
+pm2 start scripts/serve.js --interpreter node --name clawpanel -- --port 1420
+```
+
+说明：
+
+- bootstrap 文件只会在**首次导入**时生效
+- 导入成功后，ClawPanel 会自动删除该文件，避免明文 `client_secret` 长期留在目标机
+- 后续如果要新增其他自动化调用方，可以继续通过安全设置页创建 OAuth Client
+- OAuth 只有在 ClawPanel 已设置访问密码时才会启用；如果开启了“无视风险模式”，OAuth 会自动禁用
+
+拿到 `client_id/client_secret` 后，可以这样换 token：
+
+```bash
+curl -s http://127.0.0.1:1420/oauth/token \
+  -u "deploy-controller:replace-with-generated-secret" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=client_credentials&scope=panel:admin"
+```
+
+刷新 token：
+
+```bash
+curl -s http://127.0.0.1:1420/oauth/token \
+  -u "deploy-controller:replace-with-generated-secret" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=refresh_token&refresh_token=<your_refresh_token>"
+```
+
+带 Bearer 调用业务 API：
+
+```bash
+curl -s http://127.0.0.1:1420/__api/get_services_status \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <your_access_token>" \
+  -d '{}'
+```
+
 ---
 
 ## Nginx 反向代理
